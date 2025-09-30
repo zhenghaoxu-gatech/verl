@@ -52,6 +52,18 @@ model:
   # LoRA target modules: "all-linear" or list of linear projection layers
   target_modules: all-linear
 
+  # Optional value head customization
+  value_head:
+
+    # Hidden layer sizes for the value head MLP (empty = default linear head)
+    hidden_sizes: []
+
+    # Activation function for hidden layers
+    activation: silu
+
+    # Dropout probability applied after each hidden layer
+    dropout: 0.0
+
 # Forward-only batch size during inference (global)
 forward_micro_batch_size: ${oc.select:.ppo_micro_batch_size,null}
 
@@ -63,3 +75,6 @@ ulysses_sequence_parallel_size: 1
 
 # Gradient clipping for critic updates
 grad_clip: 1.0
+
+# Value loss type for the critic ("squared" or "mle")
+value_loss_type: ${oc.select:critic.value_loss_type,squared}

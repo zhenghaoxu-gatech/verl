@@ -258,6 +258,10 @@ actor_rollout_ref:
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
+    value_head:
+      hidden_sizes: []
+      activation: silu
+      dropout: 0.0
     exclude_modules: null
     use_liger: false
     use_fused_kernels: false
@@ -346,6 +350,10 @@ critic:
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear
+    value_head:
+      hidden_sizes: []
+      activation: silu
+      dropout: 0.0
   _target_: verl.workers.config.FSDPCriticConfig
   rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
   strategy: fsdp
@@ -360,6 +368,7 @@ critic:
   shuffle: ${oc.select:actor_rollout_ref.actor.shuffle,false}
   cliprange_value: 0.5
   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+  value_loss_type: squared
   checkpoint:
     _target_: verl.trainer.config.CheckpointConfig
     save_contents:

@@ -64,6 +64,9 @@ class MegatronPPOCritic(BasePPOCritic):
         self.critic_optimizer = critic_optimizer
         self.critic_optimizer_config = critic_optimizer_config
 
+        self.value_loss_type = getattr(self.config, "value_loss_type", "squared").lower()
+        self._use_mle_loss = self.value_loss_type == "mle"
+
         # we create a separate nametuple for optimizer step so that global args won't affect it.
         self.optimizer_step_args = OmegaConf.create(
             {
@@ -124,6 +127,8 @@ class MegatronPPOCritic(BasePPOCritic):
             values = values[
                 :, -response_length - 1 : -1
             ]  # Values are predicted at the ends of prefixes, e.g., the last prompt token
+            if self._use_mle_loss:
+                values = torch.sigmoid(values)
             response_mask = attention_mask[:, -response_length:]
             values = values * response_mask  # Only action tokens have values
             values = values.contiguous()
@@ -229,12 +234,15 @@ class MegatronPPOCritic(BasePPOCritic):
                 response_mask=response_mask,
                 cliprange_value=cliprange_value,
                 loss_agg_mode=self.config.loss_agg_mode,
+                loss_type=self.value_loss_type,
             )
+
+            value_for_metric = torch.sigmoid(vpreds) if self._use_mle_loss else vpreds
 
             stats = {
                 "critic/vf_loss": vf_loss.detach().item(),
                 "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                "critic/vpred_mean": masked_mean(value_for_metric, response_mask).detach().item(),
             }
 
             return vf_loss, stats

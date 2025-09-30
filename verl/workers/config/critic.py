@@ -26,7 +26,13 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["CriticConfig", "FSDPCriticConfig", "McoreCriticConfig", "FSDPCriticModelCfg"]
+__all__ = [
+    "CriticConfig",
+    "FSDPCriticConfig",
+    "McoreCriticConfig",
+    "FSDPCriticModelCfg",
+    "ValueHeadConfig",
+]
 
 
 @dataclass
@@ -78,6 +84,7 @@ class CriticConfig(BaseConfig):
     shuffle: bool = True
     cliprange_value: float = 0.5
     loss_agg_mode: str = "token-mean"
+    value_loss_type: str = "squared"
     ppo_micro_batch_size: Optional[int] = None
     engine: BaseConfig = field(default_factory=BaseConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -90,6 +97,13 @@ class CriticConfig(BaseConfig):
     def __post_init__(self):
         """Validate critic configuration parameters."""
         assert self.strategy != MISSING
+
+        valid_value_loss_types = {"squared", "mle"}
+        if self.value_loss_type not in valid_value_loss_types:
+            raise ValueError(
+                f"Unsupported critic.value_loss_type '{self.value_loss_type}'. "
+                f"Expected one of {sorted(valid_value_loss_types)}."
+            )
 
         if self.model_config is None:
             warnings.warn("using model in Critic Config is deprecated, please use model_config instead", stacklevel=2)
@@ -221,6 +235,31 @@ class FSDPCriticConfig(CriticConfig):
 
 
 @dataclass
+class ValueHeadConfig(BaseConfig):
+    """Configuration block for customizing the critic value head architecture."""
+
+    hidden_sizes: tuple[int, ...] = field(default_factory=tuple)
+    activation: str = "silu"
+    dropout: float = 0.0
+
+    def __post_init__(self):
+        if isinstance(self.hidden_sizes, list):
+            self.hidden_sizes = tuple(self.hidden_sizes)
+        self.hidden_sizes = tuple(int(size) for size in self.hidden_sizes)
+
+        valid_activations = {"relu", "gelu", "silu", "tanh", "identity", "none"}
+        self.activation = self.activation.lower()
+        if self.activation not in valid_activations:
+            raise ValueError(
+                f"Unsupported value head activation '{self.activation}'. "
+                f"Expected one of {sorted(valid_activations)}."
+            )
+
+        if self.dropout < 0.0 or self.dropout >= 1.0:
+            raise ValueError("value head dropout must be >= 0 and < 1.")
+
+
+@dataclass
 class FSDPCriticModelCfg(BaseModelConfig):
     """FSDP-enabled critic model configuration.
     Inherits base critic settings and adds distributed-memory and LoRA options.
@@ -238,6 +277,7 @@ class FSDPCriticModelCfg(BaseModelConfig):
 
     use_shm: bool = False
     enable_activation_offload: bool = False
+    value_head: Optional[ValueHeadConfig] = None
     use_remove_padding: bool = False
     enable_gradient_checkpointing: bool = True
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)

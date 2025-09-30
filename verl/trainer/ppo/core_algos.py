@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig
 
 import verl.utils.torch_functional as verl_F
@@ -815,6 +816,8 @@ def compute_policy_loss(
             Defaults to 3.0.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        loss_type (str, optional):
+            Value loss type. "squared" (default) uses clipped MSE; "mle" applies binary cross-entropy on logits.
     """
     assert clip_ratio_c > 1.0, (
         "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
@@ -1298,6 +1301,7 @@ def compute_value_loss(
     response_mask: torch.Tensor,
     cliprange_value: float,
     loss_agg_mode: str = "token-mean",
+    loss_type: str = "squared",
 ):
     """
     Compute the clipped value-function loss for PPO.
@@ -1324,13 +1328,24 @@ def compute_value_loss(
         vf_clipfrac (float):
             Fraction of elements where the clipped loss was used.
     """
-    vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
-    vf_losses1 = (vpreds - returns) ** 2
-    vf_losses2 = (vpredclipped - returns) ** 2
-    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
-    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
-    return vf_loss, vf_clipfrac
+    loss_type = loss_type.lower()
+
+    if loss_type == "squared":
+        vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
+        vf_losses1 = (vpreds - returns) ** 2
+        vf_losses2 = (vpredclipped - returns) ** 2
+        clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+        vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+        return vf_loss, vf_clipfrac
+    if loss_type == "mle":
+        labels = returns.clamp(0.0, 1.0)
+        bce_loss = F.binary_cross_entropy_with_logits(vpreds, labels, reduction="none")
+        vf_loss = agg_loss(loss_mat=bce_loss, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        vf_clipfrac = torch.zeros((), device=vpreds.device, dtype=vpreds.dtype)
+        return vf_loss, vf_clipfrac
+
+    raise ValueError(f"Unsupported value loss type '{loss_type}'.")
 
 
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:

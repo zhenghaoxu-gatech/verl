@@ -111,6 +111,8 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
 
+    loss_type = getattr(config, "value_loss_type", "squared").lower()
+
     vf_loss, vf_clipfrac = compute_value_loss(
         vpreds=vpreds,
         values=values,
@@ -118,15 +120,18 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         response_mask=response_mask,
         cliprange_value=config.cliprange_value,
         loss_agg_mode=config.loss_agg_mode,
+        loss_type=loss_type,
     )
 
     metrics = {}
+
+    value_for_metric = torch.sigmoid(vpreds) if loss_type == "mle" else vpreds
 
     metrics.update(
         {
             "critic/vf_loss": vf_loss.detach().item(),
             "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+            "critic/vpred_mean": masked_mean(value_for_metric, response_mask).detach().item(),
         }
     )
 

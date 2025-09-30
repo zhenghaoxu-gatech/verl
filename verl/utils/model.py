@@ -19,7 +19,7 @@ import os
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -663,6 +663,45 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
     model = AutoModelForCausalLMWithValueHead.from_pretrained(ori_model)
     patch_valuehead_model(model)
     return model
+
+
+_VALUE_HEAD_ACTIVATIONS = {
+    "relu": nn.ReLU,
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
+    "tanh": nn.Tanh,
+    "identity": nn.Identity,
+    "none": nn.Identity,
+}
+
+
+def build_value_head(
+    input_dim: int,
+    hidden_sizes: Sequence[int],
+    activation: str = "silu",
+    dropout: float = 0.0,
+) -> nn.Module:
+    """Create a value head MLP with configurable hidden layers and activation."""
+
+    hidden_sizes = list(hidden_sizes)
+    activation_key = activation.lower()
+    if activation_key not in _VALUE_HEAD_ACTIVATIONS:
+        raise ValueError(
+            f"Unsupported activation '{activation}'. Expected one of {sorted(_VALUE_HEAD_ACTIVATIONS.keys())}."
+        )
+
+    layers: list[nn.Module] = []
+    in_dim = input_dim
+    for hidden_dim in hidden_sizes:
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        activation_cls = _VALUE_HEAD_ACTIVATIONS[activation_key]
+        layers.append(activation_cls())
+        in_dim = hidden_dim
+
+    layers.append(nn.Linear(in_dim, 1))
+    return nn.Sequential(*layers)
 
 
 _architecture_to_auto_class = {

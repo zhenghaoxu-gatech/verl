@@ -83,11 +83,11 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
+from verl.utils.model import build_value_head, compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
-from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
+from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig, ValueHeadConfig
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -1187,6 +1187,69 @@ class CriticWorker(Worker, DistProfilerExtension):
         self._is_lora = self.config.model.get("lora_rank", 0) > 0
         self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
 
+    def _resolve_value_head_config(self) -> Optional[ValueHeadConfig]:
+        value_head_cfg = getattr(self.config.model, "value_head", None)
+        if value_head_cfg is None:
+            return None
+
+        if isinstance(value_head_cfg, DictConfig):
+            value_head_cfg = omega_conf_to_dataclass(value_head_cfg, dataclass_type=ValueHeadConfig)
+            self.config.model.value_head = value_head_cfg
+        elif isinstance(value_head_cfg, dict):
+            value_head_cfg = ValueHeadConfig(**value_head_cfg)
+            self.config.model.value_head = value_head_cfg
+        elif not isinstance(value_head_cfg, ValueHeadConfig):
+            raise TypeError(
+                "critic.model.value_head must be dict-like or ValueHeadConfig, "
+                f"got {type(value_head_cfg)}"
+            )
+
+        return value_head_cfg
+
+    def _apply_custom_value_head(self, critic_module) -> None:
+        value_head_cfg = self._resolve_value_head_config()
+        if value_head_cfg is None:
+            return
+
+        head_attr = None
+        current_head = None
+        for attr in ("v_head", "value_head", "classifier"):
+            if hasattr(critic_module, attr):
+                head_attr = attr
+                current_head = getattr(critic_module, attr)
+                break
+
+        if head_attr is None or current_head is None:
+            raise ValueError("Unable to locate value head on critic module; cannot apply custom value_head config.")
+
+        if hasattr(current_head, "in_features"):
+            input_dim = current_head.in_features
+        elif hasattr(current_head, "weight"):
+            input_dim = current_head.weight.shape[1]
+        else:
+            input_dim = getattr(self.critic_model_config, "hidden_size", None)
+            if input_dim is None and hasattr(self.critic_model_config, "text_config"):
+                input_dim = getattr(self.critic_model_config.text_config, "hidden_size", None)
+        if input_dim is None:
+            raise ValueError("Unable to infer input dimension for critic value head.")
+
+        new_head = build_value_head(
+            input_dim=input_dim,
+            hidden_sizes=value_head_cfg.hidden_sizes,
+            activation=value_head_cfg.activation,
+            dropout=value_head_cfg.dropout,
+        )
+        setattr(critic_module, head_attr, new_head)
+
+        if self.rank == 0:
+            print(
+                "Applied custom critic value head",
+                f"attr={head_attr}",
+                f"hidden_sizes={list(value_head_cfg.hidden_sizes)}",
+                f"activation={value_head_cfg.activation}",
+                f"dropout={value_head_cfg.dropout}",
+            )
+
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
         from torch import optim
@@ -1240,6 +1303,8 @@ class CriticWorker(Worker, DistProfilerExtension):
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
 
+        self.critic_model_config = critic_model_config
+
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not critic_model_config.tie_word_embeddings, mesh=self.device_mesh
         )
@@ -1265,6 +1330,8 @@ class CriticWorker(Worker, DistProfilerExtension):
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
             )
 
+            self._apply_custom_value_head(critic_module)
+
             # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)
 
@@ -1286,8 +1353,6 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         if self.rank == 0:
             print_model_size(critic_module)
-
-        self.critic_model_config = critic_model_config
 
         fsdp_config = self.config.model.fsdp_config
         mixed_precision_config = fsdp_config.get("mixed_precision", None)

@@ -47,6 +47,9 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
+        self.value_loss_type = getattr(self.config, "value_loss_type", "squared").lower()
+        self._use_mle_loss = self.value_loss_type == "mle"
+
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
 
@@ -176,6 +179,8 @@ class DataParallelPPOCritic(BasePPOCritic):
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 values = self._forward_micro_batch(model_inputs)
+                if self._use_mle_loss:
+                    values = torch.sigmoid(values)
             values_lst.append(values)
         values = torch.concat(values_lst, dim=0)
 
@@ -233,6 +238,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                         response_mask=response_mask,
                         cliprange_value=self.config.cliprange_value,
                         loss_agg_mode=self.config.loss_agg_mode,
+                        loss_type=self.value_loss_type,
                     )
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
@@ -244,11 +250,12 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                     loss.backward()
 
+                    value_for_metric = torch.sigmoid(vpreds) if self._use_mle_loss else vpreds
                     micro_batch_metrics.update(
                         {
                             "critic/vf_loss": vf_loss.detach().item() * loss_scale_factor,
                             "critic/vf_clipfrac": vf_clipfrac.detach().item(),
-                            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+                            "critic/vpred_mean": masked_mean(value_for_metric, response_mask).detach().item(),
                         }
                     )
 
