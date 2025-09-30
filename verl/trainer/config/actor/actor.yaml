@@ -71,6 +71,9 @@ clip_ratio_c: 3.0
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
 loss_agg_mode: token-mean
 
+# Importance sampling ratio mode: "token", "seq_mean", or "seq_prod"
+importance_ratio_mode: token
+
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 

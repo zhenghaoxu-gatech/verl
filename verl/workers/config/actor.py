@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -72,6 +73,7 @@ class ActorConfig(BaseConfig):
         clip_ratio_c (float): Clipping ratio for critic loss.
         loss_agg_mode (str): Loss aggregation mode. Options: 'token-mean', 'sample-mean'.
         entropy_coeff (float): Entropy coefficient for regularization.
+        importance_ratio_mode (str): Importance sampling ratio mode. Options: 'token', 'seq_mean', 'seq_prod'.
         use_kl_loss (bool): Whether to use KL divergence loss.
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
@@ -111,6 +113,7 @@ class ActorConfig(BaseConfig):
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
+    importance_ratio_mode: str = "token"
     ppo_epochs: int = 1
     shuffle: bool = False
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -139,6 +142,23 @@ class ActorConfig(BaseConfig):
                     "'actor.ppo_micro_batch_size_per_gpu' if use_dynamic_bsz is not enabled."
                 )
 
+        legacy_importance_modes = {
+            "sequence": "seq_mean",
+            "sequence_geomean": "seq_mean",
+            "sequence_product": "seq_prod",
+        }
+        if self.importance_ratio_mode in legacy_importance_modes:
+            warnings.warn(
+                "importance_ratio_mode='"
+                + self.importance_ratio_mode
+                + "' is deprecated. Please use '"
+                + legacy_importance_modes[self.importance_ratio_mode]
+                + "' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.importance_ratio_mode = legacy_importance_modes[self.importance_ratio_mode]
+
         valid_loss_agg_modes = [
             "token-mean",
             "seq-mean-token-sum",
@@ -147,6 +167,13 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        valid_importance_modes = ["token", "seq_mean", "seq_prod"]
+        if self.importance_ratio_mode not in valid_importance_modes:
+            raise ValueError(
+                "Invalid importance_ratio_mode:"
+                f" {self.importance_ratio_mode}. Expected one of {valid_importance_modes}."
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

@@ -827,7 +827,24 @@ def compute_policy_loss(
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
+    importance_ratio_mode = getattr(config, "importance_ratio_mode", "token")
+
+    if importance_ratio_mode == "token":
+        ratio = torch.exp(negative_approx_kl)
+    elif importance_ratio_mode == "seq_mean":
+        # Normalize by length to recover the geometric mean of token ratios.
+        seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+        log_seq_ratio = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+        log_seq_ratio = torch.clamp(log_seq_ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(log_seq_ratio).unsqueeze(-1)
+    elif importance_ratio_mode == "seq_prod":
+        # Use the raw product of token ratios for an unbiased sequence multiplier.
+        log_seq_ratio = torch.sum(negative_approx_kl * response_mask, dim=-1)
+        log_seq_ratio = torch.clamp(log_seq_ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(log_seq_ratio).unsqueeze(-1)
+    else:
+        raise ValueError(f"Unsupported importance_ratio_mode: {importance_ratio_mode}")
+
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_losses1 = -advantages * ratio
@@ -909,7 +926,24 @@ def compute_policy_loss_vanilla(
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
+    importance_ratio_mode = getattr(config, "importance_ratio_mode", "token")
+
+    if importance_ratio_mode == "token":
+        ratio = torch.exp(negative_approx_kl)
+    elif importance_ratio_mode == "seq_mean":
+        # Normalize by length to recover the geometric mean of token ratios.
+        seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+        log_seq_ratio = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+        log_seq_ratio = torch.clamp(log_seq_ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(log_seq_ratio).unsqueeze(-1)
+    elif importance_ratio_mode == "seq_prod":
+        # Use the raw product of token ratios for an unbiased sequence multiplier.
+        log_seq_ratio = torch.sum(negative_approx_kl * response_mask, dim=-1)
+        log_seq_ratio = torch.clamp(log_seq_ratio, min=-20.0, max=20.0)
+        ratio = torch.exp(log_seq_ratio).unsqueeze(-1)
+    else:
+        raise ValueError(f"Unsupported importance_ratio_mode: {importance_ratio_mode}")
+
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_losses1 = -advantages * ratio
