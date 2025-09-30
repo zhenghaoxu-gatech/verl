@@ -1,8 +1,11 @@
+#!/bin/bash
+
+############# BEGIN OF CONFIG
+
 INITIATIVE_ID=Rufus-shared
 # INITIATIVE_ID=Rufus-post-training
 # INITIATIVE_ID=RufusPilotInitiative
 
-JOB_NAME=think-rm-qwen3-4b-rloo
 
 DATA_ROOT=/root/data/think_rm
 OUTPUT_ROOT=/root/outputs/think_rm
@@ -15,19 +18,22 @@ WANDB_PROJECT=${WANDB_PROJECT:-verl_think_rm}
 WANDB_GROUP=${WANDB_GROUP:-think_rm}
 
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-256}
-PROMPT_LENGTH=${PROMPT_LENGTH:-8192}
+PROMPT_LENGTH=${PROMPT_LENGTH:-4096}
 RESPONSE_LENGTH=${RESPONSE_LENGTH:-4096}
 ROLLOUT_SAMPLES=${ROLLOUT_SAMPLES:-4}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
 CRITIC_PPO_MINI_BATCH_SIZE=${CRITIC_PPO_MINI_BATCH_SIZE:-128}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
 TEST_FREQ=${TEST_FREQ:-20}
-SAVE_FREQ=${SAVE_FREQ:-$TEST_FREQ}
+SAVE_FREQ=${SAVE_FREQ:-5}
+CRITIC_VALUE_LOSS_TYPE=squared
+# CRITIC_VALUE_LOSS_TYPE=mle
 
 MAX_MODEL_LEN=$((PROMPT_LENGTH + RESPONSE_LENGTH))
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_think_rm_p${PROMPT_LENGTH}_r${RESPONSE_LENGTH}_bs${TRAIN_BATCH_SIZE}_n${ROLLOUT_SAMPLES}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_think_rm_p${PROMPT_LENGTH}_r${RESPONSE_LENGTH}_bs${TRAIN_BATCH_SIZE}_n${ROLLOUT_SAMPLES}_l${CRITIC_VALUE_LOSS_TYPE}}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-s3://shopqa-users/zxugt/checkpoints/verl}
 
+JOB_NAME=think-rm-qwen3-4b-rloo_p${PROMPT_LENGTH}_r${RESPONSE_LENGTH}_bs${TRAIN_BATCH_SIZE}_n${ROLLOUT_SAMPLES}_l${CRITIC_VALUE_LOSS_TYPE}
 ############# END OF CONFIG
 
 case "$INITIATIVE_ID" in
@@ -76,20 +82,21 @@ export WANDB_GROUP=${WANDB_GROUP} && \
 export WANDB_KEY=${WANDB_KEY} && \
 export WANDB_API_KEY=${WANDB_KEY} && \
 export HF_HOME=/root/.cache/huggingface && \
-if aws s3 ls ${CKPT_S3_PREFIX_LOCAL}/ >/dev/null 2>&1; then \
-  aws s3 sync ${CKPT_S3_PREFIX_LOCAL} ${CKPT_DIR_LOCAL}; \
-fi && \
+bash recipe/think_rm/download_latest_checkpoint.sh ${CKPT_S3_PREFIX_LOCAL} ${CKPT_DIR_LOCAL} && \
 { \
   while true; do \
-    aws s3 sync ${CKPT_DIR_LOCAL} ${CKPT_S3_PREFIX_LOCAL}; \
-    sleep 600; \
+    aws s3 sync ${CKPT_DIR_LOCAL} ${CKPT_S3_PREFIX_LOCAL} --exclude latest_checkpointed_iteration.txt && \
+    if [ -f ${CKPT_DIR_LOCAL}/latest_checkpointed_iteration.txt ]; then \
+      aws s3 cp ${CKPT_DIR_LOCAL}/latest_checkpointed_iteration.txt ${CKPT_S3_PREFIX_LOCAL}/latest_checkpointed_iteration.txt; \
+    fi && \
+    sleep 300; \
   done & \
 } && \
 SYNC_PID=$! && \
 trap 'kill \$SYNC_PID 2>/dev/null || true' EXIT && \
 TRAIN_PARQUET=${TRAIN_PARQUET_LOCAL} VAL_PARQUET=${VAL_PARQUET_LOCAL} PROJECT_NAME=${PROJECT_NAME} EXPERIMENT_NAME=${EXPERIMENT_NAME} \
 N_GPUS_PER_NODE=${NUM_GPUS_PER_NODE} N_NODES=${NUM_NODES} \
-bash recipe/think_rm/run_think_rm.sh \
+bash recipe/think_rm/run_think_rm_2layer.sh \
   data.train_batch_size=${TRAIN_BATCH_SIZE} \
   data.val_batch_size=null \
   data.max_prompt_length=${PROMPT_LENGTH} \
@@ -110,6 +117,7 @@ bash recipe/think_rm/run_think_rm.sh \
   actor_rollout_ref.ref.fsdp_config.optimizer_offload=True \
   critic.ppo_mini_batch_size=${CRITIC_PPO_MINI_BATCH_SIZE} \
   critic.use_dynamic_bsz=True \
+  critic.value_loss_type=${CRITIC_VALUE_LOSS_TYPE} \
   critic.model.fsdp_config.param_offload=True \
   critic.model.fsdp_config.optimizer_offload=True \
   trainer.total_epochs=${TOTAL_EPOCHS} \
@@ -119,7 +127,10 @@ bash recipe/think_rm/run_think_rm.sh \
   trainer.resume_mode=auto && \
 kill $SYNC_PID 2>/dev/null || true && \
 wait $SYNC_PID 2>/dev/null || true && \
-aws s3 sync ${CKPT_DIR_LOCAL} ${CKPT_S3_PREFIX_LOCAL} --delete && \
-if [ -n "${S3_OUTPUT}" ]; then \
-  aws s3 sync ${OUTPUT_ROOT_LOCAL} ${S3_OUTPUT} --delete; \
+aws s3 sync ${CKPT_DIR_LOCAL} ${CKPT_S3_PREFIX_LOCAL} --exclude latest_checkpointed_iteration.txt && \
+if [ -f ${CKPT_DIR_LOCAL}/latest_checkpointed_iteration.txt ]; then \
+  aws s3 cp ${CKPT_DIR_LOCAL}/latest_checkpointed_iteration.txt ${CKPT_S3_PREFIX_LOCAL}/latest_checkpointed_iteration.txt; \
+fi && \
+if [ -n ${S3_OUTPUT} ]; then \
+  aws s3 sync ${OUTPUT_ROOT_LOCAL} ${S3_OUTPUT}; \
 fi

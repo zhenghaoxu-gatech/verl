@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import warnings
+from ast import literal_eval
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -243,17 +244,39 @@ class ValueHeadConfig(BaseConfig):
     dropout: float = 0.0
 
     def __post_init__(self):
-        if isinstance(self.hidden_sizes, list):
-            self.hidden_sizes = tuple(self.hidden_sizes)
-        self.hidden_sizes = tuple(int(size) for size in self.hidden_sizes)
+        hidden_sizes = self.hidden_sizes
+        if isinstance(hidden_sizes, str) and hidden_sizes.strip():
+            try:
+                hidden_sizes = literal_eval(hidden_sizes)
+            except (ValueError, SyntaxError) as exc:
+                raise ValueError(
+                    "Failed to parse critic value head hidden_sizes from string. "
+                    "Expected a Python literal such as '[2560, 1024]'."
+                ) from exc
+
+        if hidden_sizes is None:
+            hidden_sizes = ()
+        elif isinstance(hidden_sizes, int):
+            hidden_sizes = (hidden_sizes,)
+        elif isinstance(hidden_sizes, (list, tuple)):
+            hidden_sizes = tuple(hidden_sizes)
+        else:
+            raise TypeError(
+                "critic value head hidden_sizes must be an int, sequence of ints, or string literal."
+            )
+
+        hidden_sizes = tuple(int(size) for size in hidden_sizes)
+
+        object.__setattr__(self, "hidden_sizes", hidden_sizes)
 
         valid_activations = {"relu", "gelu", "silu", "tanh", "identity", "none"}
-        self.activation = self.activation.lower()
-        if self.activation not in valid_activations:
+        activation = str(self.activation).lower()
+        if activation not in valid_activations:
             raise ValueError(
                 f"Unsupported value head activation '{self.activation}'. "
                 f"Expected one of {sorted(valid_activations)}."
             )
+        object.__setattr__(self, "activation", activation)
 
         if self.dropout < 0.0 or self.dropout >= 1.0:
             raise ValueError("value head dropout must be >= 0 and < 1.")

@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -205,11 +206,44 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
+    def _compute_discounted_returns(
+        reward_tensor: torch.Tensor, mask_tensor: torch.Tensor, gamma_value: float
+    ) -> torch.Tensor:
+        """Compute Monte Carlo returns from token-level rewards, respecting padding mask."""
+
+        if reward_tensor.numel() == 0:
+            return reward_tensor
+
+        rewards = reward_tensor * mask_tensor.to(reward_tensor.dtype)
+        if rewards.numel() == 0:
+            return rewards
+
+        if math.isclose(gamma_value, 0.0, rel_tol=1e-6, abs_tol=1e-6):
+            returns = rewards
+        elif math.isclose(gamma_value, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+            returns = torch.flip(torch.cumsum(torch.flip(rewards, dims=[-1]), dim=-1), dims=[-1])
+        else:
+            steps = torch.arange(rewards.size(-1), device=rewards.device, dtype=rewards.dtype)
+            gamma_pows = torch.pow(torch.full_like(steps, gamma_value), steps)
+            reversed_gamma = torch.flip(gamma_pows, dims=[-1])
+            discounted = torch.cumsum(torch.flip(rewards, dims=[-1]) * reversed_gamma, dim=-1)
+            returns = torch.flip(discounted, dims=[-1]) / torch.clamp(gamma_pows, min=1e-8)
+
+        return returns * mask_tensor.to(reward_tensor.dtype)
+
+    estimator_name = (
+        adv_estimator.value if isinstance(adv_estimator, AdvantageEstimator) else str(adv_estimator)
+    )
+
+    if data.meta_info is None:
+        data.meta_info = {}
+    data.meta_info["adv_estimator"] = estimator_name
+
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
-    if adv_estimator == AdvantageEstimator.GAE:
+    if estimator_name == AdvantageEstimator.GAE.value:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -220,13 +254,13 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        if config.get("use_pf_ppo", False):
+        if config and config.get("use_pf_ppo", False):
             data = core_algos.compute_pf_ppo_reweight_data(
                 data,
                 config.pf_ppo.get("reweight_method"),
                 config.pf_ppo.get("weight_pow"),
             )
-    elif adv_estimator == AdvantageEstimator.GRPO:
+    elif estimator_name == AdvantageEstimator.GRPO.value:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
 
@@ -255,7 +289,18 @@ def compute_advantage(
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
+        if estimator_name in {
+            AdvantageEstimator.RLOO.value,
+            AdvantageEstimator.RLOO_VECTORIZED.value,
+        }:
+            raw_returns = _compute_discounted_returns(
+                reward_tensor=data.batch["token_level_rewards"],
+                mask_tensor=data.batch["response_mask"],
+                gamma_value=gamma,
+            )
+            data.batch["returns"] = raw_returns
+        else:
+            data.batch["returns"] = returns
     return data
 
 

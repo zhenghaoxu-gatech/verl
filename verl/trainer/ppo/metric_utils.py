@@ -135,11 +135,36 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    advantage_gap_metrics: dict[str, float] = {}
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
+
+        adv_estimator_name = None
+        if batch.meta_info is not None:
+            adv_estimator_name = batch.meta_info.get("adv_estimator")
+
+        if adv_estimator_name in {"rloo", "rloo_vectorized"} and non_aborted_mask.any():
+            first_token_indices = torch.argmax(response_mask.long(), dim=-1)
+            first_token_indices = torch.clamp(first_token_indices, max=response_mask.size(-1) - 1)
+
+            seq_rewards = torch.sum(
+                batch.batch["token_level_rewards"] * response_mask.float(), dim=-1
+            )
+            rloo_adv = advantages.gather(1, first_token_indices.unsqueeze(-1)).squeeze(-1)
+            value_baseline = values.gather(1, first_token_indices.unsqueeze(-1)).squeeze(-1)
+
+            pred_adv = seq_rewards - value_baseline
+            advantage_gap = (pred_adv - rloo_adv)[non_aborted_mask]
+
+            if advantage_gap.numel() > 0:
+                advantage_gap_metrics = {
+                    "critic/advantage_gap/mean": advantage_gap.mean().detach().item(),
+                    "critic/advantage_gap/abs_mean": advantage_gap.abs().mean().detach().item(),
+                }
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -207,6 +232,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+
+    metrics.update(advantage_gap_metrics)
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

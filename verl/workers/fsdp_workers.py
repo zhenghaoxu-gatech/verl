@@ -29,6 +29,7 @@ import psutil
 import torch
 import torch.distributed
 import torch.distributed as dist
+import torch.nn as nn
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model
@@ -1188,22 +1189,26 @@ class CriticWorker(Worker, DistProfilerExtension):
         self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
 
     def _resolve_value_head_config(self) -> Optional[ValueHeadConfig]:
+        cached_cfg = getattr(self, "_cached_value_head_cfg", None)
+        if cached_cfg is not None:
+            return cached_cfg
+
         value_head_cfg = getattr(self.config.model, "value_head", None)
         if value_head_cfg is None:
+            self._cached_value_head_cfg = None
             return None
 
         if isinstance(value_head_cfg, DictConfig):
             value_head_cfg = omega_conf_to_dataclass(value_head_cfg, dataclass_type=ValueHeadConfig)
-            self.config.model.value_head = value_head_cfg
         elif isinstance(value_head_cfg, dict):
             value_head_cfg = ValueHeadConfig(**value_head_cfg)
-            self.config.model.value_head = value_head_cfg
         elif not isinstance(value_head_cfg, ValueHeadConfig):
             raise TypeError(
                 "critic.model.value_head must be dict-like or ValueHeadConfig, "
                 f"got {type(value_head_cfg)}"
             )
 
+        self._cached_value_head_cfg = value_head_cfg
         return value_head_cfg
 
     def _apply_custom_value_head(self, critic_module) -> None:
@@ -1211,22 +1216,65 @@ class CriticWorker(Worker, DistProfilerExtension):
         if value_head_cfg is None:
             return
 
-        head_attr = None
-        current_head = None
-        for attr in ("v_head", "value_head", "classifier"):
-            if hasattr(critic_module, attr):
-                head_attr = attr
-                current_head = getattr(critic_module, attr)
+        candidate_paths: tuple[tuple[str, ...], ...] = (
+            ("v_head",),
+            ("value_head",),
+            ("classifier",),
+            ("score",),
+            ("pretrained_model", "v_head"),
+            ("pretrained_model", "value_head"),
+            ("pretrained_model", "classifier"),
+            ("pretrained_model", "score"),
+            ("model", "value_head"),
+            ("model", "classifier"),
+            ("model", "score"),
+        )
+
+        def _locate_module(root: nn.Module, path: tuple[str, ...]) -> tuple[nn.Module | None, nn.Module | None]:
+            parent = None
+            current: nn.Module | None = root
+            for name in path:
+                if current is None or not hasattr(current, name):
+                    return None, None
+                parent = current
+                current = getattr(current, name)
+                if not isinstance(current, nn.Module):
+                    return None, None
+            return parent, current
+
+        target_parent = None
+        target_module = None
+        target_path: tuple[str, ...] | None = None
+        for path in candidate_paths:
+            parent, module = _locate_module(critic_module, path)
+            if parent is not None and module is not None:
+                target_parent, target_module, target_path = parent, module, path
                 break
 
-        if head_attr is None or current_head is None:
-            raise ValueError("Unable to locate value head on critic module; cannot apply custom value_head config.")
+        if target_module is None or target_parent is None or target_path is None:
+            available = [name for name in dir(critic_module) if not name.startswith("__")]
+            raise ValueError(
+                "Unable to locate value head on critic module; cannot apply custom value_head config. "
+                f"Searched attribute paths {candidate_paths} but module of type {critic_module.__class__.__name__} "
+                f"exposes {available[:50]}..."
+            )
 
-        if hasattr(current_head, "in_features"):
-            input_dim = current_head.in_features
-        elif hasattr(current_head, "weight"):
-            input_dim = current_head.weight.shape[1]
-        else:
+        def _infer_input_dim(module: nn.Module) -> int | None:
+            if hasattr(module, "in_features"):
+                return getattr(module, "in_features")
+            if hasattr(module, "weight") and isinstance(getattr(module, "weight"), torch.Tensor):
+                return module.weight.shape[1]
+            for child in module.modules():
+                if child is module:
+                    continue
+                if hasattr(child, "in_features"):
+                    return getattr(child, "in_features")
+                if hasattr(child, "weight") and isinstance(getattr(child, "weight"), torch.Tensor):
+                    return child.weight.shape[1]
+            return None
+
+        input_dim = _infer_input_dim(target_module)
+        if input_dim is None:
             input_dim = getattr(self.critic_model_config, "hidden_size", None)
             if input_dim is None and hasattr(self.critic_model_config, "text_config"):
                 input_dim = getattr(self.critic_model_config.text_config, "hidden_size", None)
@@ -1239,12 +1287,12 @@ class CriticWorker(Worker, DistProfilerExtension):
             activation=value_head_cfg.activation,
             dropout=value_head_cfg.dropout,
         )
-        setattr(critic_module, head_attr, new_head)
+        setattr(target_parent, target_path[-1], new_head)
 
         if self.rank == 0:
             print(
                 "Applied custom critic value head",
-                f"attr={head_attr}",
+                f"attr_path={'.'.join(target_path)}",
                 f"hidden_sizes={list(value_head_cfg.hidden_sizes)}",
                 f"activation={value_head_cfg.activation}",
                 f"dropout={value_head_cfg.dropout}",
