@@ -126,4 +126,23 @@ def compute_binary_reward(data_source, solution_str, ground_truth, extra_info):
     if pref_score is not None:
         result["preference_score"] = float(pref_score)
 
+    num_annotators = extra_info.get("num_annotators")
+    if num_annotators is not None:
+        result["num_annotators"] = float(num_annotators)
+
+    for label in ("response_1", "response_2", "tie"):
+        prob_key = f"prob_{label}"
+        prob_val = extra_info.get(prob_key)
+        if prob_val is not None:
+            result[prob_key] = float(prob_val)
+
+    if predicted_raw in {"response_1", "response_2", "tie"}:
+        prob_key = f"prob_{predicted_raw}"
+        prob_val = extra_info.get(prob_key)
+        if prob_val is not None:
+            result["predicted_label_prob"] = float(prob_val)
+
+    if "predicted_label_prob" not in result:
+        result["predicted_label_prob"] = float("nan")
+
     return result

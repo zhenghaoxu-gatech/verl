@@ -17,7 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -77,7 +77,41 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def _expected_calibration_error(pred: torch.Tensor, target: torch.Tensor, num_bins: int = 10) -> float:
+    """Compute the expected calibration error for binary predictions."""
+
+    if pred.numel() == 0:
+        return float("nan")
+
+    # Ensure values are detached to avoid autograd tracking during logging.
+    pred = pred.detach()
+    target = target.detach()
+
+    bin_edges = torch.linspace(0.0, 1.0, num_bins + 1, device=pred.device)
+    bin_indices = torch.bucketize(pred, bin_edges, right=True) - 1
+    bin_indices = torch.clamp(bin_indices, 0, num_bins - 1)
+
+    total = pred.numel()
+    ece = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+    for bin_idx in range(num_bins):
+        mask = bin_indices == bin_idx
+        count = mask.sum()
+        if count.item() == 0:
+            continue
+        prob_mean = pred[mask].mean()
+        target_mean = target[mask].mean()
+        ece += (count.float() / total) * torch.abs(prob_mean - target_mean)
+
+    return ece.detach().cpu().item()
+
+
+def compute_data_metrics(
+    batch: DataProto,
+    use_critic: bool = True,
+    value_loss_type: Optional[str] = None,
+    log_value_calibration: bool = False,
+) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -88,6 +122,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     Args:
         batch: A DataProto object containing batch data with token-level scores, rewards, advantages, etc.
         use_critic: Whether to include critic-specific metrics. Defaults to True.
+        value_loss_type: Loss type used by critic value head (e.g., "squared", "mle").
+        log_value_calibration: Whether to compute calibration diagnostics for the critic predictions.
 
     Returns:
         A dictionary of metrics including:
@@ -137,6 +173,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     advantage_gap_metrics: dict[str, float] = {}
 
+    calibration_metrics: dict[str, float] = {}
+
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
@@ -165,6 +203,126 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                     "critic/advantage_gap/mean": advantage_gap.mean().detach().item(),
                     "critic/advantage_gap/abs_mean": advantage_gap.abs().mean().detach().item(),
                 }
+
+        if log_value_calibration:
+            seq_rewards = torch.sum(batch.batch["token_level_rewards"] * response_mask.float(), dim=-1)
+
+            response_token_counts = torch.sum(response_mask.long(), dim=-1)
+            last_token_indices = torch.clamp(response_token_counts - 1, min=0, max=response_mask.size(-1) - 1)
+
+            seq_values = values.gather(1, last_token_indices.unsqueeze(-1)).squeeze(-1)
+
+            seq_rewards = seq_rewards[non_aborted_mask].float()
+            seq_values = seq_values[non_aborted_mask].float()
+
+            if seq_rewards.numel() > 0:
+                loss_type = str(value_loss_type).lower() if value_loss_type is not None else "squared"
+
+                if loss_type == "mle":
+                    # Critic workers already apply sigmoid when using MLE loss, so
+                    # `seq_values` arrives as probabilities in [0, 1].
+                    seq_probs = seq_values
+                else:
+                    seq_probs = seq_values
+
+                seq_probs = seq_probs.clamp(0.0, 1.0)
+
+                predicted_labels = batch.non_tensor_batch.get("predicted_label")
+                label_prob_arrays: dict[str, Any] = {
+                    label: batch.non_tensor_batch.get(f"prob_{label}")
+                    for label in ("response_1", "response_2", "tie")
+                }
+
+                expected_probs = torch.full_like(seq_probs, torch.nan)
+                if predicted_labels is not None and any(prob is not None for prob in label_prob_arrays.values()):
+                    non_aborted_indices = torch.nonzero(non_aborted_mask, as_tuple=False).squeeze(-1).cpu().numpy()
+                    predicted_labels = np.array(predicted_labels, dtype=object)[non_aborted_indices]
+
+                    for label, prob_array in label_prob_arrays.items():
+                        if prob_array is None:
+                            continue
+                        prob_tensor = torch.as_tensor(prob_array, device=seq_probs.device, dtype=seq_probs.dtype)
+                        if prob_tensor.numel() != non_aborted_mask.size(0):
+                            continue
+                        prob_tensor = prob_tensor[non_aborted_mask]
+                        label_mask = torch.from_numpy((predicted_labels == label)).to(seq_probs.device)
+                        if label_mask.numel() != prob_tensor.numel():
+                            continue
+                        expected_probs[label_mask] = prob_tensor[label_mask]
+
+                observed_rewards = seq_rewards.clamp(0.0, 1.0)
+                observed_diff = seq_probs - observed_rewards
+
+                eps = 1e-6
+                probs_clamped = seq_probs.clamp(eps, 1.0 - eps)
+
+                expected_mask = torch.isfinite(expected_probs)
+                expected_count = int(expected_mask.sum().item())
+                total_count = float(seq_rewards.numel())
+
+                calibration_metrics = {
+                    "critic/value_calibration/brier": float("nan"),
+                    "critic/value_calibration/logloss": float("nan"),
+                    "critic/value_calibration/mae": float("nan"),
+                    "critic/value_calibration/mean_gap": float("nan"),
+                    "critic/value_calibration/pred_mean": torch.mean(seq_probs).detach().item(),
+                    "critic/value_calibration/expected_mean": float("nan"),
+                    "critic/value_calibration/observed_mean": torch.mean(observed_rewards).detach().item(),
+                    "critic/value_calibration/accuracy": float("nan"),
+                    "critic/value_calibration/ece": float("nan"),
+                    "critic/value_calibration/count": float(expected_count),
+                    "critic/value_calibration/total_count": total_count,
+                }
+
+                if expected_count > 0:
+                    seq_probs_masked = seq_probs[expected_mask]
+                    expected_probs_masked = expected_probs[expected_mask]
+
+                    expected_diff = seq_probs_masked - expected_probs_masked
+                    probs_clamped_masked = probs_clamped[expected_mask]
+                    log_loss_expected = -(
+                        expected_probs_masked * torch.log(probs_clamped_masked)
+                        + (1.0 - expected_probs_masked) * torch.log(1.0 - probs_clamped_masked)
+                    )
+
+                    pred_binary = (seq_probs_masked >= 0.5).float()
+
+                    calibration_metrics.update(
+                        {
+                            "critic/value_calibration/brier": torch.mean(expected_diff.square()).detach().item(),
+                            "critic/value_calibration/logloss": torch.mean(log_loss_expected).detach().item(),
+                            "critic/value_calibration/mae": torch.mean(expected_diff.abs()).detach().item(),
+                            "critic/value_calibration/mean_gap": torch.mean(expected_diff).detach().item(),
+                            "critic/value_calibration/expected_mean": torch.mean(expected_probs_masked).detach().item(),
+                            "critic/value_calibration/accuracy": torch.mean(
+                                (pred_binary == torch.round(expected_probs_masked)).float()
+                            )
+                            .detach()
+                            .item(),
+                            "critic/value_calibration/ece": _expected_calibration_error(
+                                seq_probs_masked, expected_probs_masked
+                            ),
+                        }
+                    )
+
+                    if loss_type != "mle":
+                        raw_diff = (seq_values[expected_mask] - expected_probs_masked).detach()
+                        calibration_metrics.update(
+                            {
+                                "critic/value_calibration/raw_mae": torch.mean(raw_diff.abs()).item(),
+                                "critic/value_calibration/raw_mse": torch.mean(raw_diff.square()).item(),
+                            }
+                        )
+
+                calibration_metrics.setdefault("critic/value_calibration/raw_mae", float("nan"))
+                calibration_metrics.setdefault("critic/value_calibration/raw_mse", float("nan"))
+
+                calibration_metrics.update(
+                    {
+                        "critic/value_calibration/sample_brier": torch.mean(observed_diff.square()).detach().item(),
+                        "critic/value_calibration/sample_mae": torch.mean(observed_diff.abs()).detach().item(),
+                    }
+                )
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -234,6 +392,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     }
 
     metrics.update(advantage_gap_metrics)
+    metrics.update(calibration_metrics)
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:

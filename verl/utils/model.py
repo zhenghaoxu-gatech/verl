@@ -20,6 +20,7 @@ import re
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -57,15 +58,30 @@ def squeeze(x):
 
 def update_model_config(module_config, override_config_kwargs):
     """Update the module config with the override_config_kwargs.
+
     Args:
-        module_config: The module config from Huggingface Transformers.
+        module_config: The module config from Huggingface Transformers or a mapping.
         override_config_kwargs: The kwargs to override the module config.
     """
+
     for key, val in override_config_kwargs.items():
-        if isinstance(val, dict):
-            update_model_config(getattr(module_config, key), val)
+        if isinstance(val, Mapping):
+            if isinstance(module_config, Mapping):
+                target = module_config.get(key)
+                if target is None:
+                    target = {}
+                    module_config[key] = target
+            else:
+                target = getattr(module_config, key, None)
+                if target is None or not isinstance(target, Mapping):
+                    setattr(module_config, key, {})
+                    target = getattr(module_config, key)
+            update_model_config(target, val)
         else:
-            setattr(module_config, key, val)
+            if isinstance(module_config, Mapping):
+                module_config[key] = val
+            else:
+                setattr(module_config, key, val)
 
 
 def get_huggingface_actor_config(model_name: str, override_config_kwargs=None, trust_remote_code=False) -> dict:

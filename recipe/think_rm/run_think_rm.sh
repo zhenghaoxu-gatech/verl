@@ -67,6 +67,7 @@ python -m verl.trainer.main_ppo \
     trainer.total_epochs=3 \
     trainer.save_freq=100 \
     trainer.test_freq=50 \
+    trainer.log_value_calibration_metrics=True \
     trainer.critic_warmup=0 \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE:-8} \
     trainer.nnodes=${N_NODES:-1} \

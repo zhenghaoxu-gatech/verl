@@ -762,15 +762,19 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)  # token-mean
-        loss = torch.mean(seq_losses)  # seq-mean
+        token_counts = torch.sum(loss_mask, dim=-1)
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        seq_mask = (token_counts > 0).float()
+        token_counts = token_counts.clamp(min=1.0)
+        seq_losses = torch.where(seq_mask > 0, seq_losses / token_counts, torch.zeros_like(seq_losses))
+        seq_denominator = torch.sum(seq_mask).clamp(min=1.0)
+        loss = torch.sum(seq_losses * seq_mask) / seq_denominator  # seq-mean over non-empty sequences
     elif loss_agg_mode == "seq-mean-token-sum-norm":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
-        loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor
-        # (loss_mask.shape[-1]) should ideally be constant
-        # throughout training to well-replicate the DrGRPO paper.
-        # TODO: Perhaps add user-defined normalizer argument to
-        # agg_loss to ensure divisor stays constant throughout.
+        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()
+        seq_denominator = torch.sum(seq_mask).clamp(min=1.0)
+        seq_mean = torch.sum(seq_losses * seq_mask) / seq_denominator
+        loss = seq_mean / loss_mask.shape[-1]  # normalize by constant max length
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 

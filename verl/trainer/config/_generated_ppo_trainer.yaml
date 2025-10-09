@@ -478,6 +478,7 @@ trainer:
   logger:
   - console
   - wandb
+  log_value_calibration_metrics: false
   log_val_generations: 0
   rollout_data_dir: null
   validation_data_dir: null

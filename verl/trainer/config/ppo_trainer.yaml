@@ -134,6 +134,9 @@ trainer:
   # Logging backends to use: "console", "wandb", etc.
   logger: ["console", "wandb"]
 
+  # Whether to compute and log calibration metrics for the critic value head
+  log_value_calibration_metrics: False
+
   # Number of generations to log during validation
   log_val_generations: 0
 

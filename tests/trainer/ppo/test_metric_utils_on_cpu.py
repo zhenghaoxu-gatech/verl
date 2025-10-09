@@ -94,10 +94,21 @@ class TestComputeDataMetrics(unittest.TestCase):
             ),
             "values": torch.tensor([[0.9, 1.0], [1.1, 1.2]]),
         }
+        self.batch.non_tensor_batch = {
+            "predicted_label": np.array(["response_2", "response_2"], dtype=object),
+            "prob_response_1": np.array([1.0 / 3.0, 0.5], dtype=float),
+            "prob_response_2": np.array([2.0 / 3.0, 0.25], dtype=float),
+            "prob_tie": np.array([0.0, 0.25], dtype=float),
+        }
 
     def test_compute_data_metrics_with_critic(self):
         """Test compute_data_metrics with critic enabled."""
-        metrics = compute_data_metrics(self.batch, use_critic=True)
+        metrics = compute_data_metrics(
+            self.batch,
+            use_critic=True,
+            value_loss_type="squared",
+            log_value_calibration=True,
+        )
 
         # Check that all expected metrics are present
         self.assertIn("critic/score/mean", metrics)
@@ -108,10 +119,36 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/vf_explained_var", metrics)
         self.assertIn("response_length/mean", metrics)
         self.assertIn("prompt_length/mean", metrics)
+        self.assertIn("critic/value_calibration/brier", metrics)
+        self.assertIn("critic/value_calibration/logloss", metrics)
+        self.assertIn("critic/value_calibration/mae", metrics)
+        self.assertIn("critic/value_calibration/ece", metrics)
+        self.assertIn("critic/value_calibration/count", metrics)
+        self.assertIn("critic/value_calibration/raw_mae", metrics)
+        self.assertIn("critic/value_calibration/raw_mse", metrics)
+        self.assertIn("critic/value_calibration/sample_brier", metrics)
+        self.assertIn("critic/value_calibration/sample_mae", metrics)
+        self.assertIn("critic/value_calibration/expected_mean", metrics)
+        self.assertIn("critic/value_calibration/observed_mean", metrics)
+        self.assertIn("critic/value_calibration/total_count", metrics)
 
         # Check some specific values
         self.assertAlmostEqual(metrics["critic/score/mean"], 5.0)  # Sum of token_level_scores
         self.assertAlmostEqual(metrics["critic/rewards/mean"], 2.5)  # Sum of token_level_rewards
+        self.assertAlmostEqual(metrics["critic/value_calibration/brier"], 0.3084722, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/mae"], 0.4916666, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/mean_gap"], 0.4916666, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/pred_mean"], 0.95, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/expected_mean"], 0.4583333, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/observed_mean"], 1.0, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/accuracy"], 0.5, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/ece"], 0.4916666, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/raw_mae"], 0.5416666, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/raw_mse"], 0.3884722, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/sample_brier"], 0.005, places=5)
+        self.assertAlmostEqual(metrics["critic/value_calibration/sample_mae"], 0.05, places=5)
+        self.assertEqual(metrics["critic/value_calibration/count"], 2.0)
+        self.assertEqual(metrics["critic/value_calibration/total_count"], 2.0)
 
     def test_compute_data_metrics_without_critic(self):
         """Test compute_data_metrics with critic disabled."""
@@ -120,6 +157,8 @@ class TestComputeDataMetrics(unittest.TestCase):
         # Check that critic-specific metrics are not present
         self.assertNotIn("critic/values/mean", metrics)
         self.assertNotIn("critic/vf_explained_var", metrics)
+        self.assertNotIn("critic/value_calibration/brier", metrics)
+        self.assertNotIn("critic/value_calibration/raw_mae", metrics)
 
         # Check that other metrics are still present
         self.assertIn("critic/score/mean", metrics)

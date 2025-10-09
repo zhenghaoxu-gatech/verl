@@ -3,37 +3,53 @@
 ############# BEGIN OF CONFIG
 
 INITIATIVE_ID=Rufus-shared
-# INITIATIVE_ID=Rufus-post-training
+INITIATIVE_ID=Rufus-post-training
 # INITIATIVE_ID=RufusPilotInitiative
 
+DATA_ROOT=/root/data/dapo_rloo
+OUTPUT_ROOT=/root/outputs/dapo_rloo
+S3_OUTPUT=s3://shopqa-users/zxugt/results/dapo_rloo
 
-DATA_ROOT=/root/data/think_rm
-OUTPUT_ROOT=/root/outputs/think_rm
-S3_OUTPUT=s3://shopqa-users/zxugt/results/think_rm
-
-PROJECT_NAME=${PROJECT_NAME:-verl_think_rm}
+PROJECT_NAME=${PROJECT_NAME:-verl_dapo_rloo}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_KEY=${WANDB_KEY:-5ddff28c7bb4d39af5a6d17e495058f834313ce6}
-WANDB_PROJECT=${WANDB_PROJECT:-verl_think_rm}
-WANDB_GROUP=${WANDB_GROUP:-think_rm}
+WANDB_PROJECT=${WANDB_PROJECT:-verl_dapo}
+WANDB_GROUP=${WANDB_GROUP:-dapo_rloo}
 
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-128}
-PROMPT_LENGTH=${PROMPT_LENGTH:-4096}
-RESPONSE_LENGTH=${RESPONSE_LENGTH:-4096}
-ROLLOUT_SAMPLES=${ROLLOUT_SAMPLES:-8}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-128}
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-512}
+ROLLOUT_SAMPLES=${ROLLOUT_SAMPLES:-16}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
 CRITIC_PPO_MINI_BATCH_SIZE=${CRITIC_PPO_MINI_BATCH_SIZE:-64}
-TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
-TEST_FREQ=${TEST_FREQ:-20}
+PROMPT_LENGTH=${PROMPT_LENGTH:-2048}
+RESPONSE_LENGTH=${RESPONSE_LENGTH:-8192}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-5}
+TEST_FREQ=${TEST_FREQ:-10}
 SAVE_FREQ=${SAVE_FREQ:-5}
-CRITIC_VALUE_LOSS_TYPE=squared
-# CRITIC_VALUE_LOSS_TYPE=mle
+GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}
+CRITIC_VALUE_LOSS_TYPE=mle
+# CRITIC_VALUE_LOSS_TYPE=squared
+IS=seq_prod
+IS=seq_mean
+# IS=token
+
+if [ "${IS}" = "seq_prod" ]; then
+  : "${CLIP_RATIO:=0.8}"
+  : "${CLIP_RATIO_LOW:=0.8}"
+  : "${CLIP_RATIO_HIGH:=5.0}"
+  : "${CLIP_RATIO_C:=6.0}"
+fi
+
+: "${CLIP_RATIO:=0.2}"
+: "${CLIP_RATIO_LOW:=0.2}"
+: "${CLIP_RATIO_HIGH:=0.2}"
+: "${CLIP_RATIO_C:=3.0}"
 
 MAX_MODEL_LEN=$((PROMPT_LENGTH + RESPONSE_LENGTH))
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_think_rm_p${PROMPT_LENGTH}_r${RESPONSE_LENGTH}_bs${TRAIN_BATCH_SIZE}_n${ROLLOUT_SAMPLES}_l${CRITIC_VALUE_LOSS_TYPE}}
+CONFIG_NAME=bs${TRAIN_BATCH_SIZE}_${PPO_MINI_BATCH_SIZE}_${IS}_${CLIP_RATIO_LOW}_${CLIP_RATIO_HIGH}_n${ROLLOUT_SAMPLES}_l${CRITIC_VALUE_LOSS_TYPE}
+EXPERIMENT_NAME=qwen2_5_7b_dapo_rloo_${CONFIG_NAME}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-s3://shopqa-users/zxugt/checkpoints/verl}
 
-JOB_NAME=think-rm-qwen3-4b-rloo_p${PROMPT_LENGTH}_r${RESPONSE_LENGTH}_bs${TRAIN_BATCH_SIZE}_n${ROLLOUT_SAMPLES}_l${CRITIC_VALUE_LOSS_TYPE}
+JOB_NAME=dapo-qwen2_5-7b-rloo_${CONFIG_NAME}
 ############# END OF CONFIG
 
 case "$INITIATIVE_ID" in
@@ -64,17 +80,17 @@ WORKING_DIR=/root/verl
 DATA_ROOT_LOCAL=${DATA_ROOT}
 OUTPUT_ROOT_LOCAL=${OUTPUT_ROOT}
 CKPT_DIR_LOCAL=${OUTPUT_ROOT_LOCAL}/checkpoints
-TRAIN_PARQUET_LOCAL=${DATA_ROOT_LOCAL}/rl/train.parquet
-VAL_PARQUET_LOCAL=${DATA_ROOT_LOCAL}/rl/validation.parquet
+TRAIN_PARQUET_LOCAL=${DATA_ROOT_LOCAL}/dapo-math-17k.parquet
+VAL_PARQUET_LOCAL=${DATA_ROOT_LOCAL}/aime-2024.parquet
 CKPT_S3_PREFIX_LOCAL=${CHECKPOINT_ROOT}/${EXPERIMENT_NAME}
 
 
 set -euo pipefail; \
 cd ${WORKING_DIR} && \
 pip3 install --no-deps -e .[vllm] && \
-mkdir -p ${DATA_ROOT_LOCAL}/rl ${OUTPUT_ROOT_LOCAL} ${CKPT_DIR_LOCAL} && \
+mkdir -p ${DATA_ROOT_LOCAL} ${OUTPUT_ROOT_LOCAL} ${CKPT_DIR_LOCAL} && \
 if [ ! -f ${TRAIN_PARQUET_LOCAL} ] || [ ! -f ${VAL_PARQUET_LOCAL} ]; then \
-  python recipe/think_rm/prepare_helpsteer3.py --output-dir ${DATA_ROOT_LOCAL} --splits train validation; \
+  DATA_ROOT=${DATA_ROOT_LOCAL} TRAIN_PARQUET=${TRAIN_PARQUET_LOCAL} VAL_PARQUET=${VAL_PARQUET_LOCAL} bash recipe/dapo_rloo/prepare_dapo_data.sh; \
 fi && \
 export WANDB_MODE=${WANDB_MODE} && \
 export WANDB_PROJECT=${WANDB_PROJECT} && \
@@ -82,7 +98,7 @@ export WANDB_GROUP=${WANDB_GROUP} && \
 export WANDB_KEY=${WANDB_KEY} && \
 export WANDB_API_KEY=${WANDB_KEY} && \
 export HF_HOME=/root/.cache/huggingface && \
-bash recipe/think_rm/download_latest_checkpoint.sh ${CKPT_S3_PREFIX_LOCAL} ${CKPT_DIR_LOCAL} && \
+bash recipe/dapo_rloo/download_latest_checkpoint.sh ${CKPT_S3_PREFIX_LOCAL} ${CKPT_DIR_LOCAL} && \
 { \
   while true; do \
     aws s3 sync ${CKPT_DIR_LOCAL} ${CKPT_S3_PREFIX_LOCAL} --exclude latest_checkpointed_iteration.txt && \
@@ -96,13 +112,19 @@ SYNC_PID=$! && \
 trap 'kill \$SYNC_PID 2>/dev/null || true' EXIT && \
 TRAIN_PARQUET=${TRAIN_PARQUET_LOCAL} VAL_PARQUET=${VAL_PARQUET_LOCAL} PROJECT_NAME=${PROJECT_NAME} EXPERIMENT_NAME=${EXPERIMENT_NAME} \
 N_GPUS_PER_NODE=${NUM_GPUS_PER_NODE} N_NODES=${NUM_NODES} \
-bash recipe/think_rm/run_think_rm_2layer.sh \
+bash recipe/dapo_rloo/run_dapo_rloo_2layer.sh \
   data.train_batch_size=${TRAIN_BATCH_SIZE} \
+  data.gen_batch_size=${GEN_BATCH_SIZE} \
   data.val_batch_size=null \
   data.max_prompt_length=${PROMPT_LENGTH} \
   data.max_response_length=${RESPONSE_LENGTH} \
   data.filter_overlong_prompts_workers=64 \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
+  actor_rollout_ref.actor.importance_ratio_mode=${IS} \
+  actor_rollout_ref.actor.clip_ratio=${CLIP_RATIO} \
+  actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW} \
+  actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH} \
+  actor_rollout_ref.actor.clip_ratio_c=${CLIP_RATIO_C} \
   actor_rollout_ref.actor.fsdp_config.param_offload=True \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
   actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH} \

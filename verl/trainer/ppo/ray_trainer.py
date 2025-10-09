@@ -1245,7 +1245,24 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                critic_value_loss_type = None
+                log_value_calibration = False
+                if self.use_critic:
+                    critic_cfg = getattr(self.config, "critic", None)
+                    if critic_cfg is not None:
+                        critic_value_loss_type = getattr(critic_cfg, "value_loss_type", None)
+                    log_value_calibration = getattr(
+                        self.config.trainer, "log_value_calibration_metrics", False
+                    )
+
+                metrics.update(
+                    compute_data_metrics(
+                        batch=batch,
+                        use_critic=self.use_critic,
+                        value_loss_type=critic_value_loss_type,
+                        log_value_calibration=log_value_calibration,
+                    )
+                )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

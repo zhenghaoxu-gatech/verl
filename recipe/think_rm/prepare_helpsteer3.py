@@ -119,21 +119,40 @@ def _expand_split(df: Dataset, split: str, max_samples: int | None = None) -> li
         if not annotators:
             continue
 
+        valid_annots: list[tuple[int, dict, str, float]] = []
+        label_counts = {"response_1": 0, "response_2": 0, "tie": 0}
+
         for annot_idx, ann in enumerate(annotators):
             score = ann.get("score")
             if not isinstance(score, (int, float)):
                 continue
             label = _score_to_label(score)
+            label_counts[label] += 1
+            valid_annots.append((annot_idx, ann, label, float(score)))
+
+        total_votes = sum(label_counts.values())
+        if total_votes == 0:
+            continue
+
+        prob_response_1 = label_counts["response_1"] / total_votes
+        prob_response_2 = label_counts["response_2"] / total_votes
+        prob_tie = label_counts["tie"] / total_votes
+
+        for annot_idx, ann, label, score in valid_annots:
             prompt = _build_prompt(base_messages, response1, response2)
             uid = f"{split}-{pair_id}-{annot_idx}"
             reward_model = {"style": "sign", "ground_truth": label}
             extra_info = {
                 "annotator_index": annot_idx,
-                "preference_score": float(score),
+                "preference_score": score,
                 "overall_preference": overall,
                 "annotator_reasoning": ann.get("reasoning", ""),
                 "sample_index": row_idx,
                 "helpsteer_id": pair_id,
+                "num_annotators": total_votes,
+                "prob_response_1": prob_response_1,
+                "prob_response_2": prob_response_2,
+                "prob_tie": prob_tie,
             }
             records.append(
                 ExpandedRecord(

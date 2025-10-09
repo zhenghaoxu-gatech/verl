@@ -120,6 +120,11 @@ class vLLMRollout(BaseRollout):
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        logger.info(
+            "vLLM rollout using max_position_embeddings=%s rope_scaling=%s",
+            getattr(model_hf_config, "max_position_embeddings", None),
+            rope_scaling_config,
+        )
         if not rope_scaling_config:
             max_position_embeddings = None
             if hasattr(model_hf_config, "max_position_embeddings"):
@@ -185,6 +190,17 @@ class vLLMRollout(BaseRollout):
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
+        # Pass rope scaling to vLLM if present so the engine derives the correct
+        # max context length instead of relying solely on the base config.json.
+        # Convert HF-style key "type" to vLLM's expected key "rope_type".
+        rope_kwargs = {}
+        if rope_scaling_config:
+            vllm_rope_scaling = dict(rope_scaling_config)
+            if "rope_type" not in vllm_rope_scaling and "type" in vllm_rope_scaling:
+                # Keep original key for compatibility; add the vLLM-expected key.
+                vllm_rope_scaling["rope_type"] = vllm_rope_scaling["type"]
+            rope_kwargs = {"rope_scaling": vllm_rope_scaling}
+
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=config.free_cache_engine,
@@ -205,6 +221,7 @@ class vLLMRollout(BaseRollout):
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
             **compilation_config,
+            **rope_kwargs,
             **self.lora_kwargs,
             **engine_kwargs,
         )
