@@ -1484,6 +1484,30 @@ def compute_metrics(samples: list[PairSample]) -> dict:
     return metrics
 
 
+def export_pair_generations(samples: Iterable[PairSample], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fout:
+        for sample in samples:
+            record = {
+                "prompt_id": sample.prompt_id,
+                "subset": sample.subset,
+                "base_pair_id": sample.base_pair_id,
+                "pair_id": sample.pair_id(),
+                "orientation": sample.orientation,
+                "chosen_index": sample.chosen_index,
+                "rejected_index": sample.rejected_index,
+                "num_correct": sample.num_correct,
+                "ground_truth": sample.ground_truth,
+                "predicted_label": sample.predicted_label,
+                "corrected_label": sample.corrected_label,
+                "actor_score": sample.actor_score,
+                "corrected_score": sample.corrected_score,
+                "critic_prob": sample.critic_prob,
+                "actor_output": sample.actor_output,
+            }
+            fout.write(json.dumps(record) + "\n")
+
+
 def compute_prediction_distribution(samples: Iterable[PairSample], attr: str) -> dict:
     counter: Counter[str] = Counter()
     total = 0
@@ -2061,6 +2085,7 @@ def main() -> None:
             )
 
     apply_correction(samples, args.threshold)
+    raw_samples = list(samples)
     samples = aggregate_pair_orientations(samples)
 
     actor_prediction_distribution = compute_prediction_distribution(samples, "predicted_label")
@@ -2082,12 +2107,16 @@ def main() -> None:
         "skip_critic": args.skip_critic,
         "critic_model_ref": str(critic_export) if critic_export is not None else None,
         "critic_loss_type": args.critic_loss_type,
+        "output_dir": str(output_dir),
     }
 
     metrics["prediction_distribution"] = {
         "actor": actor_prediction_distribution,
         "corrected": corrected_prediction_distribution,
     }
+
+    generations_path = output_dir / f"{Path(args.results_file).stem}_generations.jsonl"
+    export_pair_generations(raw_samples, generations_path)
 
     if args.wandb_project:
         os.environ["WANDB_PROJECT"] = args.wandb_project
@@ -2129,6 +2158,15 @@ def main() -> None:
             }
         )
 
+    checkpoint_step_name: str | None = None
+    if checkpoint_dir is not None:
+        checkpoint_step_name = checkpoint_dir.name
+    elif args.checkpoint_step:
+        step_label = str(args.checkpoint_step)
+        checkpoint_step_name = step_label if step_label.startswith("global_step_") else f"global_step_{step_label}"
+    if checkpoint_step_name:
+        metrics_config["checkpoint_step_name"] = checkpoint_step_name
+
     metrics["config"] = metrics_config
 
     output_path = output_dir / args.results_file
@@ -2136,11 +2174,24 @@ def main() -> None:
 
     if wandb and wandb_mode_env not in {"disabled", "off", "offline"}:
         try:
+            run_name_suffix_parts: list[str] = []
+            if checkpoint_step_name:
+                run_name_suffix_parts.append(checkpoint_step_name)
+            run_name_suffix_parts.append(output_dir.name)
+
+            wandb_name = wandb_run_name
+            if run_name_suffix_parts:
+                suffix = "-".join(run_name_suffix_parts)
+                if wandb_name:
+                    wandb_name = f"{wandb_name}-{suffix}"
+                else:
+                    wandb_name = suffix
+
             run = wandb.init(
                 project=wandb_project or "verl_think_rm",
                 group=wandb_group,
                 job_type="rewardbench2_eval",
-                name=wandb_run_name,
+                name=wandb_name,
                 config=metrics["config"],
             )
 
