@@ -11,12 +11,40 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
+import torch
 from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from recipe.think_rm import eval_rewardbench2 as rb
+from recipe.think_rm.eval_utils import (
+    PairSample,
+    apply_correction,
+    aggregate_pair_orientations,
+    build_pair_level_results,
+    build_prompt_messages,
+    compute_prediction_distribution,
+    ensure_hf_export,
+    find_latest_checkpoint,
+    load_token_classifier,
+    run_actor_generation_hf,
+    run_actor_generation_vllm_local,
+    run_actor_generation_vllm_server,
+    run_critic_scoring_multiproc,
+    run_critic_scoring_single,
+    save_pair_level_results,
+    save_request_generations,
+    shutdown_process,
+    start_vllm_server,
+    summarize_pair_statuses,
+    wait_for_server_ready,
+)
+
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -222,7 +250,7 @@ def prepare_model_paths(
             if not checkpoint_dir.exists():
                 raise FileNotFoundError(f"Specified checkpoint step not found: {checkpoint_dir}")
         else:
-            checkpoint_dir = rb.find_latest_checkpoint(checkpoint_root)
+            checkpoint_dir = find_latest_checkpoint(checkpoint_root)
 
         actor_ckpt = checkpoint_dir / "actor"
         critic_ckpt = checkpoint_dir / "critic"
@@ -232,10 +260,10 @@ def prepare_model_paths(
         critic_export = export_root / "critic"
 
         if not (args.reuse_export and (Path(actor_export) / "config.json").exists()):
-            rb.ensure_hf_export(actor_ckpt, Path(actor_export))
+            ensure_hf_export(actor_ckpt, Path(actor_export))
         if not args.skip_critic and critic_export is not None:
             if not (args.reuse_export and (Path(critic_export) / "config.json").exists()):
-                rb.ensure_hf_export(critic_ckpt, Path(critic_export))
+                ensure_hf_export(critic_ckpt, Path(critic_export))
 
     if actor_export is None:
         raise ValueError("Either --checkpoint-root or --actor-hf-path must be provided.")
@@ -243,8 +271,8 @@ def prepare_model_paths(
     return actor_export, critic_export, checkpoint_dir
 
 
-def _build_pair_samples(records: list[dict]) -> tuple[list[rb.PairSample], dict[str, dict]]:
-    pair_samples: list[rb.PairSample] = []
+def _build_pair_samples(records: list[dict]) -> tuple[list[PairSample], dict[str, dict]]:
+    pair_samples: list[PairSample] = []
     metadata: dict[str, dict] = {}
 
     for record in records:
@@ -264,9 +292,9 @@ def _build_pair_samples(records: list[dict]) -> tuple[list[rb.PairSample], dict[
                     "j": j,
                 }
 
-                forward_messages = rb.build_prompt_messages(prompt_text, chosen, rejected)
+                forward_messages = build_prompt_messages(prompt_text, chosen, rejected)
                 pair_samples.append(
-                    rb.PairSample(
+                    PairSample(
                         prompt_id=prompt_id,
                         subset=domain,
                         pair_index=len(pair_samples),
@@ -282,9 +310,9 @@ def _build_pair_samples(records: list[dict]) -> tuple[list[rb.PairSample], dict[
                     )
                 )
 
-                backward_messages = rb.build_prompt_messages(prompt_text, rejected, chosen)
+                backward_messages = build_prompt_messages(prompt_text, rejected, chosen)
                 pair_samples.append(
-                    rb.PairSample(
+                    PairSample(
                         prompt_id=prompt_id,
                         subset=domain,
                         pair_index=len(pair_samples),
@@ -304,7 +332,7 @@ def _build_pair_samples(records: list[dict]) -> tuple[list[rb.PairSample], dict[
 
 
 def _aggregate_sample_records(
-    aggregated_samples: Iterable[rb.PairSample],
+    aggregated_samples: Iterable[PairSample],
     metadata: dict[str, dict],
 ) -> dict[str, dict]:
     records: dict[str, dict] = {}
@@ -323,17 +351,17 @@ def _aggregate_sample_records(
             {
                 "domain": domain,
                 "actor_matrix": np.zeros((3, 3), dtype=float),
-                "corrected_matrix": np.zeros((3, 3), dtype=float),
+                "critic_matrix": np.zeros((3, 3), dtype=float),
             },
         )
 
         actor_score = sample.actor_score if sample.actor_score is not None else (
             1.0 if sample.predicted_label == "response_1" else (0.0 if sample.predicted_label == "response_2" else 0.5)
         )
-        corrected_score = sample.corrected_score if sample.corrected_score is not None else actor_score
+        critic_score = sample.corrected_score if sample.corrected_score is not None else actor_score
 
         record["actor_matrix"][i, j] = 1.0 if actor_score > 0.5 else 0.0
-        record["corrected_matrix"][i, j] = 1.0 if corrected_score > 0.5 else 0.0
+        record["critic_matrix"][i, j] = 1.0 if critic_score > 0.5 else 0.0
 
     return records
 
@@ -362,11 +390,11 @@ def compute_rmbench_metrics(sample_records: dict[str, dict]) -> dict:
         }
 
     overall_actor_sum = np.zeros((3, 3), dtype=float)
-    overall_corrected_sum = np.zeros((3, 3), dtype=float)
+    overall_critic_sum = np.zeros((3, 3), dtype=float)
     domain_sums: dict[str, dict[str, np.ndarray]] = defaultdict(
         lambda: {
             "actor": np.zeros((3, 3), dtype=float),
-            "corrected": np.zeros((3, 3), dtype=float),
+            "critic": np.zeros((3, 3), dtype=float),
         }
     )
     domain_counts: dict[str, int] = defaultdict(int)
@@ -374,27 +402,27 @@ def compute_rmbench_metrics(sample_records: dict[str, dict]) -> dict:
     for record in sample_records.values():
         domain = record["domain"]
         actor_matrix = record["actor_matrix"]
-        corrected_matrix = record["corrected_matrix"]
+        critic_matrix = record["critic_matrix"]
 
         overall_actor_sum += actor_matrix
-        overall_corrected_sum += corrected_matrix
+        overall_critic_sum += critic_matrix
 
         domain_sums[domain]["actor"] += actor_matrix
-        domain_sums[domain]["corrected"] += corrected_matrix
+        domain_sums[domain]["critic"] += critic_matrix
         domain_counts[domain] += 1
 
     num_samples = len(sample_records)
     overall_actor_acc = overall_actor_sum / num_samples
-    overall_corrected_acc = overall_corrected_sum / num_samples
+    overall_critic_acc = overall_critic_sum / num_samples
 
     overall_metrics = {
         "actor": {
             "matrix": overall_actor_acc.tolist(),
             **_compute_difficulty(overall_actor_acc),
         },
-        "corrected": {
-            "matrix": overall_corrected_acc.tolist(),
-            **_compute_difficulty(overall_corrected_acc),
+        "critic": {
+            "matrix": overall_critic_acc.tolist(),
+            **_compute_difficulty(overall_critic_acc),
         },
     }
 
@@ -402,16 +430,16 @@ def compute_rmbench_metrics(sample_records: dict[str, dict]) -> dict:
     for domain, sums in domain_sums.items():
         count = domain_counts[domain]
         actor_acc = sums["actor"] / count
-        corrected_acc = sums["corrected"] / count
+        critic_acc = sums["critic"] / count
         domain_metrics[domain] = {
             "count": count,
             "actor": {
                 "matrix": actor_acc.tolist(),
                 **_compute_difficulty(actor_acc),
             },
-            "corrected": {
-                "matrix": corrected_acc.tolist(),
-                **_compute_difficulty(corrected_acc),
+            "critic": {
+                "matrix": critic_acc.tolist(),
+                **_compute_difficulty(critic_acc),
             },
         }
 
@@ -439,12 +467,12 @@ def main() -> None:
 
     pair_samples, pair_metadata = _build_pair_samples(records)
 
-    num_gpus = rb.torch.cuda.device_count()
-    dtype = rb.torch.bfloat16 if num_gpus > 0 else rb.torch.float32
-    device = rb.torch.device("cuda" if num_gpus > 0 else "cpu")
+    num_gpus = torch.cuda.device_count()
+    dtype = torch.bfloat16 if num_gpus > 0 else torch.float32
+    device = torch.device("cuda" if num_gpus > 0 else "cpu")
 
     actor_tokenizer_source = args.actor_hf_tokenizer or actor_export
-    actor_tokenizer = rb.AutoTokenizer.from_pretrained(actor_tokenizer_source, trust_remote_code=True)
+    actor_tokenizer = AutoTokenizer.from_pretrained(actor_tokenizer_source, trust_remote_code=True)
     actor_tokenizer.padding_side = "left"
 
     actor_backend = args.actor_backend.lower()
@@ -454,9 +482,9 @@ def main() -> None:
     if actor_backend == "server":
         server_proc: subprocess.Popen | None = None
         try:
-            server_proc = rb.start_vllm_server(Path(actor_model_ref), args.server_port, args.actor_data_parallel_size)
-            rb.wait_for_server_ready(args.server_port, args.server_startup_timeout)
-            rb.run_actor_generation_vllm_server(
+            server_proc = start_vllm_server(Path(actor_model_ref), args.server_port, args.actor_data_parallel_size)
+            wait_for_server_ready(args.server_port, args.server_startup_timeout)
+            run_actor_generation_vllm_server(
                 actor_tokenizer,
                 pair_samples,
                 str(actor_model_ref),
@@ -466,7 +494,7 @@ def main() -> None:
                 args.actor_request_timeout,
             )
         finally:
-            rb.shutdown_process(server_proc, args.server_shutdown_timeout)
+            shutdown_process(server_proc, args.server_shutdown_timeout)
     elif actor_backend == "vllm":
         if num_gpus == 0:
             raise RuntimeError("vLLM backend requires CUDA but no GPU was detected.")
@@ -475,7 +503,7 @@ def main() -> None:
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("vLLM is not installed; re-run with --actor-backend hf or install vllm.") from exc
 
-        dtype_str = "bfloat16" if dtype == rb.torch.bfloat16 else "float32"
+        dtype_str = "bfloat16" if dtype == torch.bfloat16 else "float32"
         actor_llm = LLM(
             model=str(actor_model_ref),
             tokenizer=str(actor_model_ref),
@@ -487,14 +515,14 @@ def main() -> None:
         sampling_params = SamplingParams(
             max_tokens=args.max_new_tokens,
         )
-        rb.run_actor_generation_vllm_local(actor_llm, sampling_params, actor_tokenizer, pair_samples, args.actor_batch_size)
+        run_actor_generation_vllm_local(actor_llm, sampling_params, actor_tokenizer, pair_samples, args.actor_batch_size)
     else:
-        actor_model = rb.AutoModelForCausalLM.from_pretrained(
+        actor_model = AutoModelForCausalLM.from_pretrained(
             actor_model_ref,
             torch_dtype=dtype,
             trust_remote_code=True,
         ).to(device)
-        rb.run_actor_generation_hf(actor_model, actor_tokenizer, pair_samples, args.max_new_tokens, args.actor_batch_size)
+        run_actor_generation_hf(actor_model, actor_tokenizer, pair_samples, args.max_new_tokens, args.actor_batch_size)
 
     run_critic = not args.skip_critic and critic_export is not None
     critic_workers: int = 0
@@ -511,7 +539,7 @@ def main() -> None:
             raise ValueError("--critic-hf-path must point to a local directory when using baseline evaluation.")
 
         if critic_workers > 1:
-            rb.run_critic_scoring_multiproc(
+            run_critic_scoring_multiproc(
                 pair_samples,
                 Path(critic_model_ref),
                 Path(critic_export) if isinstance(critic_export, (str, Path)) else None,
@@ -521,13 +549,13 @@ def main() -> None:
                 critic_workers,
             )
         else:
-            critic_model, critic_tokenizer = rb.load_token_classifier(
+            critic_model, critic_tokenizer = load_token_classifier(
                 Path(critic_model_ref),
                 dtype,
                 Path(critic_export) if isinstance(critic_export, (str, Path)) else None,
             )
             critic_model.to(device)
-            rb.run_critic_scoring_single(
+            run_critic_scoring_single(
                 critic_model,
                 critic_tokenizer,
                 pair_samples,
@@ -535,14 +563,23 @@ def main() -> None:
                 critic_outputs_logits,
             )
 
-    rb.apply_correction(pair_samples, args.threshold)
-    aggregated_samples = rb.aggregate_pair_orientations(pair_samples)
+    apply_correction(pair_samples, args.threshold)
+    raw_samples = list(pair_samples)
+    aggregated_samples = aggregate_pair_orientations(pair_samples)
 
     sample_records = _aggregate_sample_records(aggregated_samples, pair_metadata)
     metrics_summary = compute_rmbench_metrics(sample_records)
 
-    actor_prediction_distribution = rb.compute_prediction_distribution(aggregated_samples, "predicted_label")
-    corrected_prediction_distribution = rb.compute_prediction_distribution(aggregated_samples, "corrected_label")
+    actor_prediction_distribution = compute_prediction_distribution(aggregated_samples, "predicted_label")
+    critic_prediction_distribution = compute_prediction_distribution(aggregated_samples, "corrected_label")
+
+    generations_path = output_dir / f"{Path(args.results_file).stem}_generations.jsonl"
+    save_request_generations(raw_samples, generations_path)
+
+    pair_results = build_pair_level_results(raw_samples)
+    pair_results_path = output_dir / f"{Path(args.results_file).stem}_pair_results.jsonl"
+    save_pair_level_results(pair_results, pair_results_path)
+    pair_status_summary = summarize_pair_statuses(pair_results)
 
     metrics_config = {
         "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir is not None else None,
@@ -561,6 +598,13 @@ def main() -> None:
         "critic_loss_type": args.critic_loss_type,
     }
 
+    metrics_config.update(
+        {
+            "generation_path": str(generations_path),
+            "pair_results_path": str(pair_results_path),
+        }
+    )
+
     if actor_backend == "vllm":
         metrics_config.update(
             {
@@ -578,12 +622,16 @@ def main() -> None:
             }
         )
 
+    total_pairs = len(aggregated_samples)
+
     metrics = {
         "summary": metrics_summary,
         "prediction_distribution": {
             "actor": actor_prediction_distribution,
-            "corrected": corrected_prediction_distribution,
+            "critic": critic_prediction_distribution,
         },
+        "pair_status_summary": pair_status_summary,
+        "total_pairs": total_pairs,
         "config": metrics_config,
     }
 
@@ -615,9 +663,9 @@ def main() -> None:
     with output_path.open("w") as fout:
         json.dump(metrics, fout, indent=2)
 
-    if rb.wandb and wandb_mode_env not in {"disabled", "off", "offline"}:
+    if wandb and wandb_mode_env not in {"disabled", "off", "offline"}:
         try:
-            run = rb.wandb.init(
+            run = wandb.init(
                 project=wandb_project or "verl_think_rm",
                 group=wandb_group,
                 job_type="rmbench_eval",
@@ -625,43 +673,57 @@ def main() -> None:
                 config=metrics["config"],
             )
 
+            def _maybe_add(target: dict[str, float], key: str, value: Any) -> None:
+                if value is None:
+                    return
+                if isinstance(value, float) and math.isnan(value):
+                    return
+                target[key] = value
+
             overall = metrics_summary.get("overall", {})
             actor_overall = overall.get("actor", {})
-            corrected_overall = overall.get("corrected", {})
+            critic_overall = overall.get("critic", {})
 
-            log_payload = {
-                "rmbench/overall/actor_hard_acc": actor_overall.get("hard"),
-                "rmbench/overall/actor_normal_acc": actor_overall.get("normal"),
-                "rmbench/overall/actor_easy_acc": actor_overall.get("easy"),
-                "rmbench/overall/corrected_hard_acc": corrected_overall.get("hard"),
-                "rmbench/overall/corrected_normal_acc": corrected_overall.get("normal"),
-                "rmbench/overall/corrected_easy_acc": corrected_overall.get("easy"),
-                "rmbench/num_samples": metrics_summary.get("num_samples"),
-            }
+            pair_summary = metrics.get("pair_status_summary", {})
+            actor_pair_status = pair_summary.get("actor", {})
+            critic_pair_status = pair_summary.get("critic", {})
 
+            core_payload: dict[str, float] = {}
+            _maybe_add(core_payload, "rmbench-core/actor/hard_acc", actor_overall.get("hard"))
+            _maybe_add(core_payload, "rmbench-core/actor/normal_acc", actor_overall.get("normal"))
+            _maybe_add(core_payload, "rmbench-core/actor/easy_acc", actor_overall.get("easy"))
+            _maybe_add(core_payload, "rmbench-core/critic/hard_acc", critic_overall.get("hard"))
+            _maybe_add(core_payload, "rmbench-core/critic/normal_acc", critic_overall.get("normal"))
+            _maybe_add(core_payload, "rmbench-core/critic/easy_acc", critic_overall.get("easy"))
+            _maybe_add(core_payload, "rmbench-core/actor/pair_consistency_rate", actor_pair_status.get("consistency_rate"))
+            _maybe_add(core_payload, "rmbench-core/critic/pair_consistency_rate", critic_pair_status.get("consistency_rate"))
+            _maybe_add(core_payload, "rmbench-core/num_samples", metrics_summary.get("num_samples"))
+            _maybe_add(core_payload, "rmbench-core/total_pairs", metrics.get("total_pairs"))
+
+            aux_payload: dict[str, float] = {}
             for domain, stats in metrics_summary.get("domains", {}).items():
                 actor_stats = stats.get("actor", {})
-                corrected_stats = stats.get("corrected", {})
-                prefix = f"rmbench/domains/{domain}"
-                log_payload[f"{prefix}/count"] = stats.get("count", 0)
-                log_payload[f"{prefix}/actor_hard_acc"] = actor_stats.get("hard")
-                log_payload[f"{prefix}/actor_normal_acc"] = actor_stats.get("normal")
-                log_payload[f"{prefix}/actor_easy_acc"] = actor_stats.get("easy")
-                log_payload[f"{prefix}/corrected_hard_acc"] = corrected_stats.get("hard")
-                log_payload[f"{prefix}/corrected_normal_acc"] = corrected_stats.get("normal")
-                log_payload[f"{prefix}/corrected_easy_acc"] = corrected_stats.get("easy")
+                critic_stats = stats.get("critic", {})
+                prefix = f"rmbench-aux/domains/{domain}"
+                _maybe_add(aux_payload, f"{prefix}/count", stats.get("count"))
+                _maybe_add(aux_payload, f"{prefix}/actor_hard_acc", actor_stats.get("hard"))
+                _maybe_add(aux_payload, f"{prefix}/actor_normal_acc", actor_stats.get("normal"))
+                _maybe_add(aux_payload, f"{prefix}/actor_easy_acc", actor_stats.get("easy"))
+                _maybe_add(aux_payload, f"{prefix}/critic_hard_acc", critic_stats.get("hard"))
+                _maybe_add(aux_payload, f"{prefix}/critic_normal_acc", critic_stats.get("normal"))
+                _maybe_add(aux_payload, f"{prefix}/critic_easy_acc", critic_stats.get("easy"))
 
-            actor_counts = actor_prediction_distribution["counts"]
-            actor_fractions = actor_prediction_distribution["fractions"]
-            corrected_counts = corrected_prediction_distribution["counts"]
-            corrected_fractions = corrected_prediction_distribution["fractions"]
-            for label in ("response_1", "response_2", "tie", "unknown"):
-                log_payload[f"rmbench/predictions/actor/{label}_count"] = actor_counts.get(label, 0)
-                log_payload[f"rmbench/predictions/actor/{label}_fraction"] = actor_fractions.get(label, 0.0)
-                log_payload[f"rmbench/predictions/corrected/{label}_count"] = corrected_counts.get(label, 0)
-                log_payload[f"rmbench/predictions/corrected/{label}_fraction"] = corrected_fractions.get(label, 0.0)
+            for mode, stats in (("actor", actor_pair_status), ("critic", critic_pair_status)):
+                rates = stats.get("rates", {}) if isinstance(stats, dict) else {}
+                prefix = f"rmbench-aux/pair_status/{mode}"
+                _maybe_add(aux_payload, f"{prefix}/clear_right_rate", rates.get("clear_right"))
+                _maybe_add(aux_payload, f"{prefix}/clear_wrong_rate", rates.get("clear_wrong"))
+                _maybe_add(aux_payload, f"{prefix}/unclear_rate", rates.get("unclear"))
+                _maybe_add(aux_payload, f"{prefix}/total_pairs", stats.get("total"))
 
-            run.log(log_payload)
+            run.log(core_payload)
+            if aux_payload:
+                run.log(aux_payload)
         except Exception as exc:  # pragma: no cover
             print(f"[WARN] WandB logging failed: {exc}")
 
