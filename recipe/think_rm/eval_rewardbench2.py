@@ -19,7 +19,6 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from recipe.think_rm.prepare_helpsteer3 import PROMPT_INSTRUCTION
 from recipe.think_rm.reward_fn import parse_preference
 from recipe.think_rm.eval_utils import (
     PairSample,
@@ -51,6 +50,13 @@ except ImportError:  # pragma: no cover - optional dependency
     wandb = None
 
 
+def _iter_combinations(length: int) -> Iterable[tuple[int, int]]:
+    """Yield unique index pairs (i, j) with i < j for a sequence of given length."""
+    for first in range(length):
+        for second in range(first + 1, length):
+            yield first, second
+
+
 def load_rewardbench_pairs(
     dataset_name: str,
     split: str,
@@ -76,11 +82,13 @@ def load_rewardbench_pairs(
 
         num_correct = int(row.get("num_correct", len(chosen)))
         total_completions = int(row.get("total_completions", len(chosen) + len(rejected)))
+        total_candidates = max(total_completions, len(chosen) + len(rejected))
+        row_tag = f"{prompt_id}-{row_idx}"
         prompt_raw_id = prompt_id
 
         for chosen_idx, pos in enumerate(chosen):
             for rejected_idx, neg in enumerate(rejected):
-                base_pair_id = f"{prompt_id}-{chosen_idx}-{rejected_idx}"
+                base_pair_id = f"{row_tag}-{chosen_idx}-{rejected_idx}"
                 forward_messages = build_prompt_messages(prompt_text, pos, neg)
                 pairs.append(
                     PairSample(
@@ -97,10 +105,14 @@ def load_rewardbench_pairs(
                         original_chosen=pos,
                         original_rejected=neg,
                         prompt_raw_id=prompt_raw_id,
+                        row_index=row_idx,
                         chosen_index=chosen_idx,
                         rejected_index=rejected_idx,
                         num_correct=num_correct,
-                        total_completions=total_completions,
+                        total_completions=total_candidates,
+                        response_1_pos=chosen_idx,
+                        response_2_pos=num_correct + rejected_idx,
+                        comparison_kind="chosen_vs_rejected",
                     )
                 )
 
@@ -120,10 +132,78 @@ def load_rewardbench_pairs(
                         original_chosen=pos,
                         original_rejected=neg,
                         prompt_raw_id=prompt_raw_id,
+                        row_index=row_idx,
                         chosen_index=chosen_idx,
                         rejected_index=rejected_idx,
                         num_correct=num_correct,
-                        total_completions=total_completions,
+                        total_completions=total_candidates,
+                        response_1_pos=num_correct + rejected_idx,
+                        response_2_pos=chosen_idx,
+                        comparison_kind="chosen_vs_rejected",
+                    )
+                )
+
+        if subset.lower() == "ties":
+            # Add same-class comparisons to estimate preference margins for RewardBench ties scoring.
+            for chosen_idx, other_idx in _iter_combinations(len(chosen)):
+                pos_a = chosen[chosen_idx]
+                pos_b = chosen[other_idx]
+                base_pair_id = f"{row_tag}-ties-cc-{chosen_idx}-{other_idx}"
+                messages = build_prompt_messages(prompt_text, pos_a, pos_b)
+                pairs.append(
+                    PairSample(
+                        prompt_id=prompt_id,
+                        subset=subset,
+                        pair_index=len(pairs),
+                        messages=messages,
+                        response_1=pos_a,
+                        response_2=pos_b,
+                        ground_truth="tie",
+                        prompt_text=prompt_text,
+                        base_pair_id=base_pair_id,
+                        orientation="forward",
+                        original_chosen=pos_a,
+                        original_rejected=pos_b,
+                        prompt_raw_id=prompt_raw_id,
+                        row_index=row_idx,
+                        chosen_index=chosen_idx,
+                        rejected_index=other_idx,
+                        num_correct=num_correct,
+                        total_completions=total_candidates,
+                        response_1_pos=chosen_idx,
+                        response_2_pos=other_idx,
+                        comparison_kind="chosen_vs_chosen",
+                    )
+                )
+
+            for rejected_idx, other_idx in _iter_combinations(len(rejected)):
+                neg_a = rejected[rejected_idx]
+                neg_b = rejected[other_idx]
+                base_pair_id = f"{row_tag}-ties-rr-{rejected_idx}-{other_idx}"
+                messages = build_prompt_messages(prompt_text, neg_a, neg_b)
+                pairs.append(
+                    PairSample(
+                        prompt_id=prompt_id,
+                        subset=subset,
+                        pair_index=len(pairs),
+                        messages=messages,
+                        response_1=neg_a,
+                        response_2=neg_b,
+                        ground_truth="tie",
+                        prompt_text=prompt_text,
+                        base_pair_id=base_pair_id,
+                        orientation="forward",
+                        original_chosen=neg_a,
+                        original_rejected=neg_b,
+                        prompt_raw_id=prompt_raw_id,
+                        row_index=row_idx,
+                        chosen_index=-1,
+                        rejected_index=rejected_idx,
+                        num_correct=num_correct,
+                        total_completions=total_candidates,
+                        response_1_pos=num_correct + rejected_idx,
+                        response_2_pos=num_correct + other_idx,
+                        comparison_kind="rejected_vs_rejected",
                     )
                 )
     return pairs
@@ -135,6 +215,7 @@ def compute_metrics(samples: list[PairSample]) -> dict:
     total_critic_score = 0.0
     total_actor_strict = 0
     total_critic_strict = 0
+    counted_pairs = 0
 
     for sample in samples:
         norm_ground_truth = sample.ground_truth or "response_1"
@@ -155,19 +236,26 @@ def compute_metrics(samples: list[PairSample]) -> dict:
         actor_score = float(np.clip(actor_score, 0.0, 1.0))
         critic_score = float(np.clip(critic_score, 0.0, 1.0))
 
-        total_actor_score += actor_score
-        total_critic_score += critic_score
-        if math.isclose(actor_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            total_actor_strict += 1
-        if math.isclose(critic_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            total_critic_strict += 1
+        affects_accuracy = sample.comparison_kind == "chosen_vs_rejected"
+        if affects_accuracy:
+            total_actor_score += actor_score
+            total_critic_score += critic_score
+            if math.isclose(actor_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+                total_actor_strict += 1
+            if math.isclose(critic_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+                total_critic_strict += 1
+            counted_pairs += 1
 
-        record = prompt_records.get(sample.prompt_id)
+        prompt_key = sample.prompt_key
+        record = prompt_records.get(prompt_key)
         if record is None:
-            total_candidates = sample.total_completions or (
-                sample.num_correct + max(sample.rejected_index, 0) + 1
-            )
-            total_candidates = max(total_candidates, sample.num_correct + sample.rejected_index + 1)
+            candidate_positions = [
+                pos for pos in (sample.response_1_pos, sample.response_2_pos) if pos is not None and pos >= 0
+            ]
+            fallback_extent = sample.num_correct + max(sample.rejected_index, -1) + 1
+            fallback_extent = max(fallback_extent, sample.num_correct, 0)
+            inferred_total = max(candidate_positions, default=fallback_extent - 1) + 1
+            total_candidates = max(sample.total_completions or 0, inferred_total, sample.num_correct)
             record = {
                 "subset": sample.subset,
                 "prompt_id": sample.prompt_id,
@@ -179,23 +267,34 @@ def compute_metrics(samples: list[PairSample]) -> dict:
                 "pair_score_critic": 0.0,
                 "pair_strict_actor": 0,
                 "pair_strict_critic": 0,
+                "pair_results_actor": [],
+                "pair_results_critic": [],
                 "scores": {name: [0.0] * total_candidates for name in ("actor", "critic", "prob")},
                 "counts": {name: [0] * total_candidates for name in ("actor", "critic", "prob")},
+                "row_index": sample.row_index,
             }
-            prompt_records[sample.prompt_id] = record
+            prompt_records[prompt_key] = record
 
-        record["pair_total"] += 1
-        record["pair_score_actor"] += actor_score
-        record["pair_score_critic"] += critic_score
-        if math.isclose(actor_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            record["pair_strict_actor"] += 1
-        if math.isclose(critic_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
-            record["pair_strict_critic"] += 1
+        if affects_accuracy:
+            record["pair_total"] += 1
+            record["pair_score_actor"] += actor_score
+            record["pair_score_critic"] += critic_score
+            if math.isclose(actor_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+                record["pair_strict_actor"] += 1
+            if math.isclose(critic_score, 1.0, rel_tol=1e-9, abs_tol=1e-9):
+                record["pair_strict_critic"] += 1
 
-        chosen_pos = sample.chosen_index
-        rejected_pos = sample.num_correct + sample.rejected_index
-        target_len = max(record["total_completions"], rejected_pos + 1)
-        _ensure_score_capacity(record, target_len)
+            record["pair_results_actor"].append(math.isclose(actor_score, 1.0, rel_tol=1e-9, abs_tol=1e-9))
+            record["pair_results_critic"].append(math.isclose(critic_score, 1.0, rel_tol=1e-9, abs_tol=1e-9))
+
+        resp1_pos = sample.response_1_pos if sample.response_1_pos >= 0 else sample.chosen_index
+        resp2_pos = sample.response_2_pos if sample.response_2_pos >= 0 else sample.num_correct + sample.rejected_index
+        response_positions = [pos for pos in (resp1_pos, resp2_pos) if pos is not None and pos >= 0]
+        if response_positions:
+            target_len = record["total_completions"]
+            for pos in response_positions:
+                target_len = max(target_len, pos + 1)
+            _ensure_score_capacity(record, target_len)
 
         metric_values = {
             "actor": actor_score,
@@ -208,10 +307,12 @@ def compute_metrics(samples: list[PairSample]) -> dict:
             value = float(np.clip(value, 0.0, 1.0))
             scores = record["scores"][metric_name]
             counts = record["counts"][metric_name]
-            scores[chosen_pos] += value
-            counts[chosen_pos] += 1
-            scores[rejected_pos] += 1.0 - value
-            counts[rejected_pos] += 1
+            if resp1_pos >= 0:
+                scores[resp1_pos] += value
+                counts[resp1_pos] += 1
+            if resp2_pos >= 0:
+                scores[resp2_pos] += 1.0 - value
+                counts[resp2_pos] += 1
 
     for record in prompt_records.values():
         for metric_name in record["scores"]:
@@ -222,9 +323,19 @@ def compute_metrics(samples: list[PairSample]) -> dict:
                     scores[idx] /= count
                 else:
                     scores[idx] = float("nan")
+        actor_pairs = record.get("pair_results_actor", [])
+        critic_pairs = record.get("pair_results_critic", [])
+        actor_success = None
+        critic_success = None
+        if actor_pairs:
+            actor_success = 1.0 if all(actor_pairs) else 0.0
+        if critic_pairs:
+            critic_success = 1.0 if all(critic_pairs) else 0.0
+        prob_success = _compute_prompt_success(record["scores"]["prob"], record["num_correct"])
         record["prompt_success"] = {
-            metric: _compute_prompt_success(record["scores"][metric], record["num_correct"])
-            for metric in ("actor", "critic", "prob")
+            "actor": actor_success,
+            "critic": critic_success,
+            "prob": prob_success,
         }
 
     subset_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -371,7 +482,7 @@ def compute_metrics(samples: list[PairSample]) -> dict:
         "critic_prompt_accuracy": overall_subset_average["critic"],
     }
 
-    total_pairs = len(samples)
+    total_pairs = counted_pairs
 
     overall_pair_metrics = {
         "actor": {

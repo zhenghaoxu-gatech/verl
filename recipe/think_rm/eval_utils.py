@@ -41,7 +41,7 @@ try:
 except ImportError:  # transformers < 4.38
     AutoModelForSequenceClassification = None  # type: ignore[assignment]
 
-from recipe.think_rm.prepare_helpsteer3 import PROMPT_INSTRUCTION
+from recipe.think_rm.preference_dataset_utils import build_prompt
 from recipe.think_rm.reward_fn import parse_preference
 
 
@@ -65,6 +65,7 @@ class PairSample:
     original_chosen: str = ""
     original_rejected: str = ""
     prompt_raw_id: str = ""
+    row_index: int = -1
     chosen_index: int = 0
     rejected_index: int = 0
     num_correct: int = 1
@@ -79,9 +80,42 @@ class PairSample:
 
     request_text: str | None = None
     full_token_ids: list[int] | None = None
+    response_1_pos: int = -1
+    response_2_pos: int = -1
+    comparison_kind: str = "chosen_vs_rejected"
 
     def pair_id(self) -> str:
         return f"{self.base_pair_id}-{self.orientation}"
+
+    @property
+    def prompt_key(self) -> str:
+        return make_prompt_key(self.subset, self.prompt_id, self.row_index, self.base_pair_id, self.pair_index)
+
+
+def make_prompt_key(
+    subset: str | None,
+    prompt_id: str | None,
+    row_index: int | None,
+    base_pair_id: str | None = None,
+    pair_index: int | None = None,
+) -> str:
+    """Build a stable identifier for a prompt even when dataset IDs collide."""
+    subset_component = (subset or "unknown").strip() or "unknown"
+
+    if prompt_id is not None:
+        prompt_component = str(prompt_id)
+        return f"{subset_component}::{prompt_component}"
+
+    if row_index is not None and row_index >= 0:
+        suffix = f"row{row_index}"
+    elif base_pair_id:
+        suffix = f"pair{base_pair_id}"
+    elif pair_index is not None and pair_index >= 0:
+        suffix = f"idx{pair_index}"
+    else:
+        suffix = "row-1"
+
+    return f"{subset_component}::{suffix}"
 
 
 @dataclass
@@ -530,24 +564,11 @@ def ensure_hf_export(source_dir: Path, target_dir: Path) -> Path:
 def build_prompt_messages(prompt_text: str, response1: str, response2: str) -> list[dict[str, str]]:
     """Reproduce the HelpSteer-style prompt used during training."""
 
-    prompt_text = (prompt_text or "").strip()
-    if not prompt_text:
-        prompt_text = "(No prior context provided.)"
-
-    comparison_request = (
-        f"{PROMPT_INSTRUCTION}\n\n"
-        "[The Start of Context]\n"
-        f"{prompt_text}\n"
-        "[The End of Context]\n\n"
-        "[The Start of Assistant A's Response]\n"
-        f"{response1}\n"
-        "[The End of Assistant A's Response]\n\n"
-        "[The Start of Assistant B's Response]\n"
-        f"{response2}\n"
-        "[The End of Assistant B's Response]"
-    )
-
-    return [{"role": "user", "content": comparison_request}]
+    context_messages: list[dict[str, str]] = []
+    cleaned_prompt = (prompt_text or "").strip()
+    if cleaned_prompt:
+        context_messages.append({"role": "user", "content": cleaned_prompt})
+    return build_prompt(context_messages, response1, response2)
 
 
 def chunked(iterable: list[PairSample], batch_size: int) -> Iterable[list[PairSample]]:
@@ -1062,8 +1083,15 @@ def _critic_worker_process(
             else:
                 probs = last_values.clamp(0.0, 1.0).detach().cpu().tolist()
 
-            for idx, prob in zip(batch_indices, probs):
-                samples[idx].critic_prob = float(prob)
+            queue.put(
+                {
+                    "type": "result",
+                    "device": device_id,
+                    "indices": batch_indices,
+                    "probs": [float(prob) for prob in probs],
+                }
+            )
+            queue.put({"type": "progress", "device": device_id, "count": len(batch_indices)})
 
         queue.put({"type": "done", "device": device_id})
     except Exception as exc:
@@ -1119,6 +1147,11 @@ def run_critic_scoring_multiproc(
             msg_type = message.get("type")
             if msg_type == "progress":
                 progress.update(message.get("count", 0))
+            elif msg_type == "result":
+                indices = message.get("indices", [])
+                probs = message.get("probs", [])
+                for idx, prob in zip(indices, probs):
+                    samples[idx].critic_prob = float(prob)
             elif msg_type == "error":
                 err_msg = message.get("error", "unknown error")
                 tb = message.get("traceback")
@@ -1217,6 +1250,9 @@ def aggregate_pair_orientations(samples: list[PairSample]) -> list[PairSample]:
             continue
 
         base = members[0]
+        if base.comparison_kind != "chosen_vs_rejected":
+            aggregated.extend(members)
+            continue
         chosen = base.original_chosen or base.response_1
         rejected = base.original_rejected or base.response_2
         prompt_text = base.prompt_text
@@ -1243,12 +1279,16 @@ def aggregate_pair_orientations(samples: list[PairSample]) -> list[PairSample]:
             original_chosen=chosen,
             original_rejected=rejected,
             prompt_raw_id=base.prompt_raw_id,
+            row_index=base.row_index,
             chosen_index=base.chosen_index,
             rejected_index=base.rejected_index,
             num_correct=base.num_correct,
             total_completions=base.total_completions,
             actor_score=actor_avg,
             corrected_score=corrected_avg,
+            response_1_pos=base.response_1_pos,
+            response_2_pos=base.response_2_pos,
+            comparison_kind=base.comparison_kind,
         )
 
         agg_sample.predicted_label = _score_to_label(actor_avg)
@@ -1294,6 +1334,8 @@ def _classify_choices(choices: list[str | None]) -> tuple[str, str | None]:
 def build_pair_level_results(samples: Iterable[PairSample]) -> list[dict[str, Any]]:
     grouped: dict[str, list[PairSample]] = defaultdict(list)
     for sample in samples:
+        if sample.comparison_kind != "chosen_vs_rejected":
+            continue
         if not sample.base_pair_id:
             continue
         grouped[sample.base_pair_id].append(sample)
@@ -1329,6 +1371,7 @@ def build_pair_level_results(samples: Iterable[PairSample]) -> list[dict[str, An
                 "subset": base.subset,
                 "chosen_index": base.chosen_index,
                 "rejected_index": base.rejected_index,
+                "row_index": base.row_index,
                 "original_chosen": base.original_chosen,
                 "original_rejected": base.original_rejected,
                 "actor_status": actor_status,
@@ -1354,6 +1397,7 @@ def save_request_generations(samples: Iterable[PairSample], path: Path) -> None:
                 "orientation": sample.orientation,
                 "chosen_index": sample.chosen_index,
                 "rejected_index": sample.rejected_index,
+                "row_index": sample.row_index,
                 "num_correct": sample.num_correct,
                 "ground_truth": sample.ground_truth,
                 "predicted_label": sample.predicted_label,
@@ -1364,6 +1408,9 @@ def save_request_generations(samples: Iterable[PairSample], path: Path) -> None:
                 "request_text": sample.request_text,
                 "actor_output": sample.actor_output,
                 "full_token_ids": sample.full_token_ids,
+                "response_1_pos": sample.response_1_pos,
+                "response_2_pos": sample.response_2_pos,
+                "comparison_kind": sample.comparison_kind,
             }
             fout.write(json.dumps(record) + "\n")
 
@@ -1407,13 +1454,18 @@ def summarize_prompt_statuses(results: Iterable[dict[str, Any]]) -> dict[str, An
 
     for record in cached:
         prompt_id = record.get("prompt_id")
-        if prompt_id is None:
+        row_index = record.get("row_index")
+        base_pair_id = record.get("base_pair_id")
+        if prompt_id is None and row_index is None and base_pair_id is None:
             continue
         subset = record.get("subset", "unknown")
+        prompt_key = make_prompt_key(subset, prompt_id, row_index, base_pair_id)
         prompt_entry = prompt_map.setdefault(
-            prompt_id,
+            prompt_key,
             {
                 "subset": subset,
+                "prompt_id": prompt_id,
+                "row_index": row_index,
                 "actor": Counter(),
                 "critic": Counter(),
             },
@@ -1448,22 +1500,17 @@ def summarize_prompt_statuses(results: Iterable[dict[str, Any]]) -> dict[str, An
             if total_pairs == 0:
                 continue
             is_strict = counts.get("clear_right", 0) == total_pairs
-            clear_wrong = counts.get("clear_wrong", 0)
-            clear_right = counts.get("clear_right", 0)
-            loose_credit = 0.0
-            if clear_wrong == 0:
-                if total_pairs == 0:
-                    loose_credit = 0.0
-                elif clear_right == total_pairs:
-                    loose_credit = 1.0
-                else:
-                    loose_credit = 0.5
+            has_clear_wrong = counts.get("clear_wrong", 0) > 0
             if is_strict:
                 overall_counts[mode]["strict_correct"] += 1
                 subset_entry[mode]["strict_correct"] += 1
-            if loose_credit > 0.0:
-                overall_counts[mode]["loose_correct"] += loose_credit
-                subset_entry[mode]["loose_correct"] += loose_credit
+            if not has_clear_wrong and total_pairs > 0:
+                num_unclear = counts.get("unclear", 0)
+                # Treat each unclear pair as a 50% chance of getting the prompt right
+                # when only one orientation is sampled at inference time.
+                loose_score = 0.5 ** num_unclear
+                overall_counts[mode]["loose_correct"] += loose_score
+                subset_entry[mode]["loose_correct"] += loose_score
 
     overall_summary = {}
     for mode in ("actor", "critic"):

@@ -46,6 +46,11 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     wandb = None
 
+DOMAIN_ORDER: tuple[str, ...] = ("chat", "code", "math", "safety")
+SCORE_VARIANTS: tuple[str, ...] = ("strict", "loose")
+AGG_MODES: tuple[str, ...] = ("actor", "critic")
+DIFFICULTY_LEVELS: tuple[str, ...] = ("easy", "normal", "hard")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Think RM checkpoints on RM-Bench.")
@@ -222,6 +227,35 @@ def load_rmbench_dataset(dataset_name: str, split: str, max_examples: int | None
     return records
 
 
+def _normalize_domain(domain: str) -> str:
+    if not domain:
+        return "unknown"
+    lowered = domain.lower()
+    for canonical in DOMAIN_ORDER:
+        if lowered.startswith(canonical):
+            return canonical
+    if lowered.startswith("safety"):
+        return "safety"
+    return lowered
+
+
+def _safe_mean(values: Iterable[float]) -> float:
+    valid = [value for value in values if value is not None and not math.isnan(value)]
+    return float(sum(valid) / len(valid)) if valid else math.nan
+
+
+def _build_metric_entry(acc_matrix: np.ndarray) -> dict[str, Any]:
+    difficulties = _compute_difficulty(acc_matrix)
+    score = _safe_mean(difficulties[level] for level in DIFFICULTY_LEVELS)
+    return {
+        "matrix": acc_matrix.tolist(),
+        "easy": difficulties["easy"],
+        "normal": difficulties["normal"],
+        "hard": difficulties["hard"],
+        "score": score,
+    }
+
+
 def resolve_dataset_split(dataset_name: str, requested_split: str | None) -> str:
     """Return the split to use for a dataset, honoring overrides when provided."""
 
@@ -278,7 +312,8 @@ def _build_pair_samples(records: list[dict]) -> tuple[list[PairSample], dict[str
     for record in records:
         prompt_id = record["id"]
         prompt_text = record["prompt"]
-        domain = record["domain"] or "unknown"
+        raw_domain = record["domain"] or "unknown"
+        domain = _normalize_domain(raw_domain)
         chosen_list = record["chosen"]
         rejected_list = record["rejected"]
 
@@ -288,6 +323,7 @@ def _build_pair_samples(records: list[dict]) -> tuple[list[PairSample], dict[str
                 metadata[base_id] = {
                     "sample_id": prompt_id,
                     "domain": domain,
+                    "raw_domain": raw_domain,
                     "i": i,
                     "j": j,
                 }
@@ -350,18 +386,24 @@ def _aggregate_sample_records(
             sample_id,
             {
                 "domain": domain,
-                "actor_matrix": np.zeros((3, 3), dtype=float),
-                "critic_matrix": np.zeros((3, 3), dtype=float),
+                "actor_matrix_strict": np.zeros((3, 3), dtype=float),
+                "actor_matrix_loose": np.zeros((3, 3), dtype=float),
+                "critic_matrix_strict": np.zeros((3, 3), dtype=float),
+                "critic_matrix_loose": np.zeros((3, 3), dtype=float),
             },
         )
 
         actor_score = sample.actor_score if sample.actor_score is not None else (
             1.0 if sample.predicted_label == "response_1" else (0.0 if sample.predicted_label == "response_2" else 0.5)
         )
+        actor_score = float(np.clip(actor_score, 0.0, 1.0))
         critic_score = sample.corrected_score if sample.corrected_score is not None else actor_score
+        critic_score = float(np.clip(critic_score, 0.0, 1.0))
 
-        record["actor_matrix"][i, j] = 1.0 if actor_score > 0.5 else 0.0
-        record["critic_matrix"][i, j] = 1.0 if critic_score > 0.5 else 0.0
+        record["actor_matrix_strict"][i, j] = 1.0 if actor_score > 0.5 else 0.0
+        record["actor_matrix_loose"][i, j] = actor_score
+        record["critic_matrix_strict"][i, j] = 1.0 if critic_score > 0.5 else 0.0
+        record["critic_matrix_loose"][i, j] = critic_score
 
     return records
 
@@ -386,66 +428,83 @@ def compute_rmbench_metrics(sample_records: dict[str, dict]) -> dict:
         return {
             "overall": {},
             "domains": {},
+            "difficulty": {},
             "num_samples": 0,
         }
 
-    overall_actor_sum = np.zeros((3, 3), dtype=float)
-    overall_critic_sum = np.zeros((3, 3), dtype=float)
-    domain_sums: dict[str, dict[str, np.ndarray]] = defaultdict(
+    overall_sums = {
+        mode: {variant: np.zeros((3, 3), dtype=float) for variant in SCORE_VARIANTS}
+        for mode in AGG_MODES
+    }
+    domain_sums: dict[str, dict[str, dict[str, np.ndarray]]] = defaultdict(
         lambda: {
-            "actor": np.zeros((3, 3), dtype=float),
-            "critic": np.zeros((3, 3), dtype=float),
+            mode: {variant: np.zeros((3, 3), dtype=float) for variant in SCORE_VARIANTS}
+            for mode in AGG_MODES
         }
     )
     domain_counts: dict[str, int] = defaultdict(int)
 
     for record in sample_records.values():
         domain = record["domain"]
-        actor_matrix = record["actor_matrix"]
-        critic_matrix = record["critic_matrix"]
-
-        overall_actor_sum += actor_matrix
-        overall_critic_sum += critic_matrix
-
-        domain_sums[domain]["actor"] += actor_matrix
-        domain_sums[domain]["critic"] += critic_matrix
+        for mode in AGG_MODES:
+            for variant in SCORE_VARIANTS:
+                key = f"{mode}_matrix_{variant}"
+                matrix = record[key]
+                overall_sums[mode][variant] += matrix
+                domain_sums[domain][mode][variant] += matrix
         domain_counts[domain] += 1
 
     num_samples = len(sample_records)
-    overall_actor_acc = overall_actor_sum / num_samples
-    overall_critic_acc = overall_critic_sum / num_samples
-
-    overall_metrics = {
-        "actor": {
-            "matrix": overall_actor_acc.tolist(),
-            **_compute_difficulty(overall_actor_acc),
-        },
-        "critic": {
-            "matrix": overall_critic_acc.tolist(),
-            **_compute_difficulty(overall_critic_acc),
-        },
-    }
-
-    domain_metrics = {}
+    domain_metrics: dict[str, dict[str, Any]] = {}
     for domain, sums in domain_sums.items():
         count = domain_counts[domain]
-        actor_acc = sums["actor"] / count
-        critic_acc = sums["critic"] / count
-        domain_metrics[domain] = {
-            "count": count,
-            "actor": {
-                "matrix": actor_acc.tolist(),
-                **_compute_difficulty(actor_acc),
-            },
-            "critic": {
-                "matrix": critic_acc.tolist(),
-                **_compute_difficulty(critic_acc),
-            },
-        }
+        entry: dict[str, Any] = {"count": count}
+        for mode in AGG_MODES:
+            entry[mode] = {}
+            for variant in SCORE_VARIANTS:
+                acc_matrix = sums[mode][variant] / count
+                entry[mode][variant] = _build_metric_entry(acc_matrix)
+        domain_metrics[domain] = entry
+
+    overall_metrics: dict[str, dict[str, Any]] = {mode: {} for mode in AGG_MODES}
+    difficulty_summary: dict[str, dict[str, Any]] = {mode: {} for mode in AGG_MODES}
+
+    for mode in AGG_MODES:
+        for variant in SCORE_VARIANTS:
+            overall_matrix = overall_sums[mode][variant] / num_samples
+            prompt_weighted = _build_metric_entry(overall_matrix)
+
+            domain_scores: dict[str, float] = {}
+            for domain in DOMAIN_ORDER:
+                if domain in domain_metrics:
+                    domain_scores[domain] = domain_metrics[domain][mode][variant]["score"]
+                else:
+                    domain_scores[domain] = math.nan
+
+            overall_score = _safe_mean(domain_scores.values())
+            difficulty_scores = {
+                level: _safe_mean(
+                    domain_metrics[domain][mode][variant][level]
+                    for domain in DOMAIN_ORDER
+                    if domain in domain_metrics
+                )
+                for level in DIFFICULTY_LEVELS
+            }
+            difficulty_scores_with_total = dict(difficulty_scores)
+            difficulty_scores_with_total["score"] = overall_score
+
+            overall_metrics[mode][variant] = {
+                "score": overall_score,
+                "domain_scores": domain_scores,
+                "difficulty_scores": difficulty_scores_with_total,
+                "prompt_weighted": prompt_weighted,
+            }
+            difficulty_summary[mode][variant] = difficulty_scores_with_total
 
     return {
         "overall": overall_metrics,
         "domains": domain_metrics,
+        "difficulty": difficulty_summary,
         "num_samples": num_samples,
     }
 
@@ -681,20 +740,27 @@ def main() -> None:
                 target[key] = value
 
             overall = metrics_summary.get("overall", {})
-            actor_overall = overall.get("actor", {})
-            critic_overall = overall.get("critic", {})
-
             pair_summary = metrics.get("pair_status_summary", {})
+
             actor_pair_status = pair_summary.get("actor", {})
             critic_pair_status = pair_summary.get("critic", {})
 
             core_payload: dict[str, float] = {}
-            _maybe_add(core_payload, "rmbench-core/actor/hard_acc", actor_overall.get("hard"))
-            _maybe_add(core_payload, "rmbench-core/actor/normal_acc", actor_overall.get("normal"))
-            _maybe_add(core_payload, "rmbench-core/actor/easy_acc", actor_overall.get("easy"))
-            _maybe_add(core_payload, "rmbench-core/critic/hard_acc", critic_overall.get("hard"))
-            _maybe_add(core_payload, "rmbench-core/critic/normal_acc", critic_overall.get("normal"))
-            _maybe_add(core_payload, "rmbench-core/critic/easy_acc", critic_overall.get("easy"))
+            for mode in AGG_MODES:
+                mode_overall = overall.get(mode, {})
+                for variant in SCORE_VARIANTS:
+                    variant_stats = mode_overall.get(variant, {})
+                    prefix = f"rmbench-core/{mode}/{variant}"
+                    _maybe_add(core_payload, f"{prefix}/overall", variant_stats.get("score"))
+
+                    difficulty_scores = variant_stats.get("difficulty_scores") or {}
+                    for level in DIFFICULTY_LEVELS:
+                        _maybe_add(core_payload, f"{prefix}/difficulty/{level}", difficulty_scores.get(level))
+
+                    domain_scores = variant_stats.get("domain_scores") or {}
+                    for domain in DOMAIN_ORDER:
+                        _maybe_add(core_payload, f"{prefix}/domain/{domain}", domain_scores.get(domain))
+
             _maybe_add(core_payload, "rmbench-core/actor/pair_consistency_rate", actor_pair_status.get("consistency_rate"))
             _maybe_add(core_payload, "rmbench-core/critic/pair_consistency_rate", critic_pair_status.get("consistency_rate"))
             _maybe_add(core_payload, "rmbench-core/num_samples", metrics_summary.get("num_samples"))
@@ -702,16 +768,24 @@ def main() -> None:
 
             aux_payload: dict[str, float] = {}
             for domain, stats in metrics_summary.get("domains", {}).items():
-                actor_stats = stats.get("actor", {})
-                critic_stats = stats.get("critic", {})
                 prefix = f"rmbench-aux/domains/{domain}"
                 _maybe_add(aux_payload, f"{prefix}/count", stats.get("count"))
-                _maybe_add(aux_payload, f"{prefix}/actor_hard_acc", actor_stats.get("hard"))
-                _maybe_add(aux_payload, f"{prefix}/actor_normal_acc", actor_stats.get("normal"))
-                _maybe_add(aux_payload, f"{prefix}/actor_easy_acc", actor_stats.get("easy"))
-                _maybe_add(aux_payload, f"{prefix}/critic_hard_acc", critic_stats.get("hard"))
-                _maybe_add(aux_payload, f"{prefix}/critic_normal_acc", critic_stats.get("normal"))
-                _maybe_add(aux_payload, f"{prefix}/critic_easy_acc", critic_stats.get("easy"))
+                for mode in AGG_MODES:
+                    mode_stats = stats.get(mode, {})
+                    for variant in SCORE_VARIANTS:
+                        variant_stats = mode_stats.get(variant, {})
+                        variant_prefix = f"{prefix}/{mode}/{variant}"
+                        _maybe_add(aux_payload, f"{variant_prefix}/score", variant_stats.get("score"))
+                        for level in DIFFICULTY_LEVELS:
+                            _maybe_add(aux_payload, f"{variant_prefix}/{level}", variant_stats.get(level))
+
+            for mode in AGG_MODES:
+                mode_overall = overall.get(mode, {})
+                for variant in SCORE_VARIANTS:
+                    prompt_weighted = mode_overall.get(variant, {}).get("prompt_weighted", {})
+                    prefix = f"rmbench-aux/overall_prompt_weighted/{mode}/{variant}"
+                    for level in (*DIFFICULTY_LEVELS, "score"):
+                        _maybe_add(aux_payload, f"{prefix}/{level}", prompt_weighted.get(level))
 
             for mode, stats in (("actor", actor_pair_status), ("critic", critic_pair_status)):
                 rates = stats.get("rates", {}) if isinstance(stats, dict) else {}
