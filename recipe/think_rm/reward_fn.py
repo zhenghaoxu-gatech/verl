@@ -1,8 +1,8 @@
 """Binary reward computation for the generative thinking reward model.
 
 Behavior:
-- We ignore anything inside <think>...</think> (case-insensitive), robust to missing closers and nested tags.
-- We extract the prediction ONLY from the LAST <label>...</label> (digit 0/1/2) found OUTSIDE <think>.
+- We drop everything up to and including the last closing </think>, treating missing closers as no prediction.
+- We extract the prediction ONLY from the LAST <label>...</label> (digit 0/1/2) found after that </think>.
 - No other heuristics (aliases in free text, final lines, XML attributes) are used for parsing the model output.
 
 Interfaces preserved:
@@ -57,57 +57,25 @@ def _normalise_choice(raw: str | None) -> Optional[str]:
     return None
 
 
-# --- New: robust think-stripper (handles missing closers and nesting) ---
-THINK_OPEN_RE  = re.compile(r"<think\b[^>]*>", re.IGNORECASE)
+# --- Think tag helpers ---
 THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
 
-def _strip_think(text: str) -> str:
+def _extract_solution_segment(text: str) -> Optional[str]:
     """
-    Remove <think>...</think> blocks robustly:
-      - Removes all balanced pairs, supporting nested <think> blocks.
-      - If an opening <think> has no matching </think>, drops everything after it.
-      - Any stray </think> with no opener is stripped.
+    Return the portion STRICTLY after the last closing </think>.
+    If no </think> is present, we treat the sample as missing a solution.
     """
-    out = []
-    i = 0
-    n = len(text)
+    last_close = None
+    for match in THINK_CLOSE_RE.finditer(text):
+        last_close = match
 
-    while i < n:
-        m_open = THINK_OPEN_RE.search(text, i)
-        if not m_open:
-            out.append(text[i:])
-            break
+    if last_close is None:
+        return None
 
-        # keep visible text up to the opener
-        out.append(text[i:m_open.start()])
-
-        # find matching close, supporting nesting
-        depth = 1
-        pos = m_open.end()
-        while depth > 0:
-            m_next_open = THINK_OPEN_RE.search(text, pos)
-            m_next_close = THINK_CLOSE_RE.search(text, pos)
-
-            if not m_next_close:
-                # unmatched opener: drop everything after the opener
-                visible = "".join(out)
-                # scrub any stray closers that might remain in the visible text
-                return THINK_CLOSE_RE.sub("", visible)
-
-            if m_next_open and m_next_open.start() < m_next_close.start():
-                depth += 1
-                pos = m_next_open.end()
-            else:
-                depth -= 1
-                pos = m_next_close.end()
-
-        # skip the entire balanced block
-        i = pos
-
-    visible = "".join(out)
-    # remove any stray closing tags left in the visible part
-    visible = THINK_CLOSE_RE.sub("", visible)
-    return visible
+    segment = text[last_close.end():]
+    # Guard against any stray closing tags in the tail.
+    segment = THINK_CLOSE_RE.sub("", segment)
+    return segment
 
 
 # --- Parsing rule: last <label>0|1|2</label> outside <think> only ---
@@ -116,12 +84,15 @@ LABEL_TAG_RE = re.compile(r"<label>\s*([012])\s*</label>", re.IGNORECASE)
 def parse_preference(output: str) -> Optional[str]:
     """
     Extract the model's final preference label by:
-      1) stripping <think>...</think> (robust),
-      2) taking the LAST <label>...</label> digit (0/1/2) in the remaining text.
+      1) selecting only the text after the last </think>,
+      2) taking the LAST <label>...</label> digit (0/1/2) in that segment.
 
     Returns one of: 'response_1' | 'response_2' | 'tie' | None
     """
-    visible = _strip_think(output)
+    visible = _extract_solution_segment(output)
+    if visible is None:
+        return None
+
     last_digit = None
     for m in LABEL_TAG_RE.finditer(visible):
         last_digit = m.group(1)

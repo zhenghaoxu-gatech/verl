@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import json
-from dataclasses import dataclass
+import sys
 from pathlib import Path
 from typing import Iterable
 
-import pandas as pd
 from datasets import Dataset, DatasetDict, load_dataset
-from textwrap import dedent
+
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parent))
+    from preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records  # type: ignore  # noqa: E402
+else:  # pragma: no cover - imported when run as module
+    from .preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records
 
 
 # Scores are annotated per response pair; we only need the sign for binary reward.
@@ -32,73 +35,6 @@ def _normalise_context(raw_context: list[dict] | None) -> list[dict[str, str]]:
         content = turn.get("content", "")
         messages.append({"role": role, "content": content})
     return messages
-
-
-PROMPT_INSTRUCTION = dedent(
-    """
-    You are an impartial judge, tasked with evaluating the quality of the two AI assistants' responses to the
-    context displayed below. Your evaluation should be based on the following six criteria:
-
-    - Helpfulness: Overall helpfulness of the response to the user's question or instruction.
-    - Correctness: Inclusion of all pertinent facts without errors.
-    - Coherence: Consistency and clarity of expression.
-    - Complexity: Intellectual depth required to write response (i.e., whether the response can be written by anyone
-      with basic language competency or requires deep domain expertise).
-    - Verbosity: Amount of detail included in the response, relative to what is asked for in the context.
-    - Safety: Whether the response is free of any kind of harmful, toxic, or illegal content.
-
-    After carefully considering these criteria, determine which assistant's response is superior. Output your final
-    verdict by strictly following this format: <label>1</label> if assistant A is better, <label>2</label> if assistant B
-    is better, and <label>0</label> only if you really cannot tell their difference.
-    """
-).strip()
-
-
-@dataclass
-class ExpandedRecord:
-    prompt: list[dict[str, str]]
-    data_source: str
-    reward_model: dict[str, object]
-    extra_info: dict[str, object]
-    uid: str
-
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "prompt": self.prompt,
-            "data_source": self.data_source,
-            "reward_model": self.reward_model,
-            "extra_info": self.extra_info,
-            "uid": self.uid,
-        }
-
-
-def _format_context(context: list[dict[str, str]]) -> str:
-    if not context:
-        return "(No prior context provided.)"
-    lines: list[str] = []
-    for turn in context:
-        role = turn.get("role", "user").capitalize()
-        content = turn.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
-def _build_prompt(context: list[dict[str, str]], response1: str, response2: str) -> list[dict[str, str]]:
-    prompt = list(context)
-    comparison_request = (
-        f"{PROMPT_INSTRUCTION}\n\n"
-        "[The Start of Context]\n"
-        f"{_format_context(context)}\n"
-        "[The End of Context]\n\n"
-        "[The Start of Assistant A's Response]\n"
-        f"{response1}\n"
-        "[The End of Assistant A's Response]\n\n"
-        "[The Start of Assistant B's Response]\n"
-        f"{response2}\n"
-        "[The End of Assistant B's Response]"
-    )
-    prompt.append({"role": "user", "content": comparison_request})
-    return prompt
 
 
 def _expand_split(df: Dataset, split: str, max_samples: int | None = None) -> list[ExpandedRecord]:
@@ -139,7 +75,7 @@ def _expand_split(df: Dataset, split: str, max_samples: int | None = None) -> li
         prob_tie = label_counts["tie"] / total_votes
 
         for annot_idx, ann, label, score in valid_annots:
-            prompt = _build_prompt(base_messages, response1, response2)
+            prompt = build_prompt(base_messages, response1, response2)
             uid = f"{split}-{pair_id}-{annot_idx}"
             reward_model = {"style": "sign", "ground_truth": label}
             extra_info = {
@@ -167,14 +103,6 @@ def _expand_split(df: Dataset, split: str, max_samples: int | None = None) -> li
     return records
 
 
-def _write_records(records: list[ExpandedRecord], destination: Path) -> None:
-    if not records:
-        raise ValueError(f"No records to persist for {destination.name} split.")
-    df = pd.DataFrame([record.as_dict() for record in records])
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(destination)
-
-
 def prepare_dataset(output_dir: Path, splits: tuple[str, ...], max_samples: int | None = None) -> None:
     dataset: DatasetDict = load_dataset("nvidia/HelpSteer3")
 
@@ -184,7 +112,7 @@ def prepare_dataset(output_dir: Path, splits: tuple[str, ...], max_samples: int 
 
         expanded = _expand_split(dataset[split], split, max_samples=max_samples)
         target_path = output_dir / "rl" / f"{split}.parquet"
-        _write_records(expanded, target_path)
+        write_records(expanded, target_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -210,16 +138,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _write_metadata(records: list[ExpandedRecord], path: Path) -> None:
-    stats = {
-        "num_records": len(records),
-        "num_positive": sum(1 for r in records if r.reward_model["ground_truth"] == "response_2"),
-        "num_negative": sum(1 for r in records if r.reward_model["ground_truth"] == "response_1"),
-        "num_tie": sum(1 for r in records if r.reward_model["ground_truth"] == "tie"),
-    }
-    path.write_text(json.dumps(stats, indent=2))
-
-
 def main() -> None:
     args = parse_args()
     output_dir: Path = args.output_dir
@@ -232,10 +150,10 @@ def main() -> None:
     for split in tuple(args.splits):
         expanded = _expand_split(dataset[split], split, max_samples=args.max_samples)
         target_path = output_dir / "rl" / f"{split}.parquet"
-        _write_records(expanded, target_path)
+        write_records(expanded, target_path)
         if args.dump_metadata:
             metadata_path = target_path.with_suffix(".json")
-            _write_metadata(expanded, metadata_path)
+            dump_metadata(expanded, metadata_path)
 
 
 if __name__ == "__main__":
