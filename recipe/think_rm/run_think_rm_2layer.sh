@@ -15,6 +15,10 @@ CRITIC_VALUE_LOSS_TYPE=${CRITIC_VALUE_LOSS_TYPE:-mle}
 CRITIC_VALUE_HEAD_HIDDEN_SIZES=${CRITIC_VALUE_HEAD_HIDDEN_SIZES:-"[2560]"}
 CRITIC_VALUE_HEAD_ACTIVATION=${CRITIC_VALUE_HEAD_ACTIVATION:-silu}
 CRITIC_VALUE_HEAD_DROPOUT=${CRITIC_VALUE_HEAD_DROPOUT:-0.0}
+LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token"}
+BASE_MODEL_NAME=${BASE_MODEL_NAME:-"Qwen/Qwen3-4B-Thinking-2507"}
+ACTOR_LR=${ACTOR_LR:-1e-6}
+USE_CRITIC=${USE_CRITIC:-True}
 
 cd "${REPO_ROOT}"
 
@@ -33,17 +37,19 @@ python -m verl.trainer.main_ppo \
     data.filter_overlong_prompts_workers=16 \
     data.truncation='error' \
     data.shuffle=True \
-    actor_rollout_ref.model.path=Qwen/Qwen3-4B-Thinking-2507 \
+    actor_rollout_ref.model.path=${BASE_MODEL_NAME} \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=${ACTOR_LR} \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
-    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum-norm \
+    actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE} \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${SP_SIZE:-1} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.temperature=0.7 \
@@ -52,15 +58,19 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.response_length=8192 \
     actor_rollout_ref.rollout.max_model_len=16384 \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${TP_SIZE:-1} \
+    actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.max_num_seqs=1024 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.optimizer_offload=True \
-    critic.enable=True \
-    critic.model.path=Qwen/Qwen3-4B-Thinking-2507 \
+    actor_rollout_ref.ref.ulysses_sequence_parallel_size=${SP_SIZE:-1} \
+    critic.enable=${USE_CRITIC} \
+    critic.model.path=${BASE_MODEL_NAME} \
+    critic.model.use_remove_padding=True \
+    critic.model.enable_gradient_checkpointing=True \
     critic.model.trust_remote_code=True \
     critic.value_loss_type=${CRITIC_VALUE_LOSS_TYPE} \
     critic.model.value_head.hidden_sizes=${CRITIC_VALUE_HEAD_HIDDEN_SIZES} \

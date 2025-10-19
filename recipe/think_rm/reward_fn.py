@@ -60,11 +60,13 @@ def _normalise_choice(raw: str | None) -> Optional[str]:
 # --- Think tag helpers ---
 THINK_CLOSE_RE = re.compile(r"</think\s*>", re.IGNORECASE)
 
-def _extract_solution_segment(text: str) -> Optional[str]:
+def _extract_solution_segment(text: str, exclude_think: bool = True) -> Optional[str]:
     """
     Return the portion STRICTLY after the last closing </think>.
     If no </think> is present, we treat the sample as missing a solution.
     """
+    if not exclude_think:
+        return text
     last_close = None
     for match in THINK_CLOSE_RE.finditer(text):
         last_close = match
@@ -81,7 +83,7 @@ def _extract_solution_segment(text: str) -> Optional[str]:
 # --- Parsing rule: last <label>0|1|2</label> outside <think> only ---
 LABEL_TAG_RE = re.compile(r"<label>\s*([012])\s*</label>", re.IGNORECASE)
 
-def parse_preference(output: str) -> Optional[str]:
+def parse_preference(output: str, from_thinking_model: bool = True) -> Optional[str]:
     """
     Extract the model's final preference label by:
       1) selecting only the text after the last </think>,
@@ -89,7 +91,7 @@ def parse_preference(output: str) -> Optional[str]:
 
     Returns one of: 'response_1' | 'response_2' | 'tie' | None
     """
-    visible = _extract_solution_segment(output)
+    visible = _extract_solution_segment(output, exclude_think=from_thinking_model)
     if visible is None:
         return None
 
@@ -114,7 +116,12 @@ def compute_binary_reward(data_source, solution_str, ground_truth, extra_info):
     canonical_gt = _normalise_choice(ground_truth)
 
     matched = predicted_raw is not None and canonical_gt is not None and predicted_raw == canonical_gt
-    reward = 1.0 if matched else 0.0
+    if matched:
+        reward = 1.0
+    elif predicted == "tie":
+        reward = 0.5
+    else:
+        reward = 0.0
 
     result = {
         "score": reward,
