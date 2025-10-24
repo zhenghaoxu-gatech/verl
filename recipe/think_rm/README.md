@@ -8,6 +8,8 @@
 
 - Install dependencies inside the Verl image: `pip install datasets pandas pyarrow` if missing.
 - Run `python recipe/think_rm/prepare_helpsteer3.py --output-dir /path/to/data` to create `rl/train.parquet` and `rl/validation.parquet`.
+- Run `python recipe/think_rm/prepare_skywork_reward.py --output-dir /path/to/data --split train` to expand the Skywork preference pairs (each pair becomes forward/backward records in `rl/train.parquet`, automatically skipping pairs with mismatched contexts).
+- Run `python recipe/think_rm/prepare_arena_human_preference.py --output-dir /path/to/data --split train` to convert the LMSYS Arena votes into per-comparison records (ties and both_bad votes are merged into the `tie` label so the reward model can learn neutrality).
 - Optional flags: `--max-samples` to cap expanded pairs, `--dump-metadata` to emit simple JSON stats.
 
 ## Training entry point

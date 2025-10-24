@@ -11,9 +11,9 @@ from datasets import Dataset, DatasetDict, load_dataset
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent))
-    from preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records  # type: ignore  # noqa: E402
+    from preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records, get_probs  # type: ignore  # noqa: E402
 else:  # pragma: no cover - imported when run as module
-    from .preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records
+    from .preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records, get_probs
 
 DATASET_NAME = "gaotang/RM-R1-Entire-RLVR-Train"
 
@@ -125,10 +125,14 @@ def _expand_split(ds: Dataset, split: str, max_samples: int | None = None) -> li
             skipped_missing_winner += 1
             continue
 
+        prob_response_1, prob_response_2, prob_tie = get_probs(label)
         prompt = build_prompt(context_messages, response_a, response_b)
         extra_info = {
             "sample_index": row_idx,
             "rmr1_split": split,
+            "prob_response_1": prob_response_1,
+            "prob_response_2": prob_response_2,
+            "prob_tie": prob_tie,
         }
 
         uid = f"{split}-{row_idx}"

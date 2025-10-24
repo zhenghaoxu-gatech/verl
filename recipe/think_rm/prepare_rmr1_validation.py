@@ -10,9 +10,9 @@ from typing import Iterable, Literal, cast
 from datasets import Dataset, load_dataset
 
 if __package__ is None or __package__ == "":
-    from preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records  # type: ignore  # noqa: E402
+    from preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records, get_probs  # type: ignore  # noqa: E402
 else:  # pragma: no cover - imported when run as module
-    from .preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records
+    from .preference_dataset_utils import ExpandedRecord, build_prompt, dump_metadata, write_records, get_probs
 
 LABEL_SWAP: dict[str, str] = {
     "response_1": "response_2",
@@ -90,6 +90,7 @@ def _collect_helpsteer(
 
         context_messages = _normalise_context(row.get("context"))
         response_a, response_b, mapped_label, orientation = _random_orientation_flip(response1, response2, label, rng)
+        prob_response_1, prob_response_2, prob_tie = get_probs(mapped_label)
         prompt = build_prompt(context_messages, response_a, response_b)
         row_id = row.get("id", row_idx)
         row_id_str = str(row_id)
@@ -101,6 +102,9 @@ def _collect_helpsteer(
                 extra_info={
                     "orientation": orientation,
                     "source_split": split,
+                    "prob_response_1": prob_response_1,
+                    "prob_response_2": prob_response_2,
+                    "prob_tie": prob_tie,
                 },
                 uid=f"helpsteer3-{split}-{row_id_str}",
             )
@@ -140,14 +144,16 @@ def _collect_rewardbench(
         if not prompt_body:
             continue
 
-        if prompt_body in seen_prompts:
-            continue
-        seen_prompts.add(prompt_body)
-
         chosen_candidates = [c for c in chosen_list if isinstance(c, str) and c.strip()]
         rejected_candidates = [r for r in rejected_list if isinstance(r, str) and r.strip()]
         if not chosen_candidates or not rejected_candidates:
             continue
+
+        subset_raw = row.get("subset", "unknown")
+        if not isinstance(subset_raw, str):
+            subset_raw = "unknown"
+        subset_clean = subset_raw.strip() or "unknown"
+        subset_slug = subset_clean.lower().replace(" ", "-").replace("/", "-")
 
         for chosen_idx, preferred in enumerate(chosen_candidates):
             for rejected_idx, dispreferred in enumerate(rejected_candidates):
@@ -157,10 +163,15 @@ def _collect_rewardbench(
                     "response_1",
                     rng,
                 )
+                prob_response_1, prob_response_2, prob_tie = get_probs(mapped_label)
                 prompt = build_prompt([{"role": "user", "content": prompt_body}], response_a, response_b)
+
+                if prompt[0]["content"] in seen_prompts:
+                    continue
+                seen_prompts.add(prompt[0]["content"])
                 prompt_id = row.get("id", row_idx)
                 prompt_id_str = str(prompt_id)
-                uid = f"rewardbench-{split}-{prompt_id_str}-c{chosen_idx}-r{rejected_idx}"
+                uid = f"rewardbench-{split}-{subset_slug}-{prompt_id_str}-c{chosen_idx}-r{rejected_idx}"
                 records.append(
                     ExpandedRecord(
                         prompt=prompt,
@@ -169,6 +180,10 @@ def _collect_rewardbench(
                         extra_info={
                             "orientation": orientation,
                             "source_split": split,
+                            "subset": subset_clean,
+                            "prob_response_1": prob_response_1,
+                            "prob_response_2": prob_response_2,
+                            "prob_tie": prob_tie,
                         },
                         uid=uid,
                     )
@@ -220,6 +235,7 @@ def _collect_rmbench(
                     "response_1",
                     rng,
                 )
+                prob_response_1, prob_response_2, prob_tie = get_probs(mapped_label)
                 prompt = build_prompt([{"role": "user", "content": prompt_body}], response_a, response_b)
                 prompt_id = row.get("id", row_idx)
                 prompt_id_str = str(prompt_id)
@@ -232,6 +248,9 @@ def _collect_rmbench(
                         extra_info={
                             "orientation": orientation,
                             "source_split": split,
+                            "prob_response_1": prob_response_1,
+                            "prob_response_2": prob_response_2,
+                            "prob_tie": prob_tie,
                         },
                         uid=uid,
                     )

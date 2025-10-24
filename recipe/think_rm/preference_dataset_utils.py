@@ -10,24 +10,43 @@ from typing import Any
 
 import pandas as pd
 
-PROMPT_INSTRUCTION = dedent(
-    """
-    You are an impartial judge, tasked with evaluating the quality of the two AI assistants' responses to the
-    context displayed below. Your evaluation should be based on the following six criteria:
+# PROMPT_INSTRUCTION = dedent(
+#     """
+#     You are an impartial judge, tasked with evaluating the quality of the two AI assistants' responses to the
+#     context displayed below. Your evaluation should be based on the following six criteria:
 
-    - Helpfulness: Overall helpfulness of the response to the user's question or instruction.
-    - Correctness: Inclusion of all pertinent facts without errors.
-    - Coherence: Consistency and clarity of expression.
-    - Complexity: Intellectual depth required to write response (i.e., whether the response can be written by anyone
-      with basic language competency or requires deep domain expertise).
-    - Verbosity: Amount of detail included in the response, relative to what is asked for in the context.
-    - Safety: Whether the response is free of any kind of harmful, toxic, or illegal content.
+#     - Helpfulness: Overall helpfulness of the response to the user's question or instruction.
+#     - Correctness: Inclusion of all pertinent facts without errors.
+#     - Coherence: Consistency and clarity of expression.
+#     - Complexity: Intellectual depth required to write response (i.e., whether the response can be written by anyone
+#       with basic language competency or requires deep domain expertise).
+#     - Verbosity: Amount of detail included in the response, relative to what is asked for in the context.
+#     - Safety: Whether the response is free of any kind of harmful, toxic, or illegal content.
 
-    After carefully considering these criteria, determine which assistant's response is superior. Output your final
-    verdict by strictly following this format: <label>1</label> if assistant A is better, <label>2</label> if assistant B
-    is better, and <label>0</label> only if you really cannot tell their difference.
-    """
-).strip()
+#     After carefully considering these criteria, determine which assistant's response is superior. Output your final
+#     verdict by strictly following this format: <label>1</label> if assistant A is better, <label>2</label> if assistant B
+#     is better, and <label>0</label> only if you really cannot tell their difference.
+#     """
+# ).strip()
+
+PROMPT_INSTRUCTION = (
+    "You are an impartial judge, tasked with evaluating the quality of the two AI assistants' responses to the "
+    "context displayed below. Your evaluation should be based on the following general criteria:\n"
+    "\n"
+    "- Helpfulness: Overall helpfulness of the response to the user's question or instruction.\n"
+    "- Correctness: Inclusion of all pertinent facts without errors.\n"
+    "- Coherence: Consistency and clarity of expression.\n"
+    "- Complexity: Intellectual depth required to write response (i.e., whether the response can be written by anyone "
+    "with basic language competency or requires deep domain expertise).\n"
+    "- Verbosity: Amount of detail included in the response, relative to what is asked for in the context.\n"
+    "- Safety: Whether the response is free of any kind of harmful, toxic, or illegal content.\n"
+    "\n"
+    "Beyond the above general criteria, propose any additional context-specific criteria that would be relevant for "
+    "evaluating the two responses. Justify why these criteria are important for this particular context.\n"
+    "After carefully considering these criteria, determine which assistant's response is superior. Output your final "
+    "verdict by strictly following this format: <label>1</label> if assistant A is better, <label>2</label> if assistant B "
+    "is better, and <label>0</label> only if you really cannot tell their difference."
+)
 
 
 @dataclass
@@ -94,3 +113,10 @@ def summarise_records(records: list[ExpandedRecord]) -> dict[str, Any]:
 
 def dump_metadata(records: list[ExpandedRecord], path: Path) -> None:
     path.write_text(json.dumps(summarise_records(records), indent=2))
+
+def get_probs(mapped_label: str) -> tuple[float, float, float]:
+    if mapped_label == "response_1":
+        return 1.0, 0.0, 0.0
+    if mapped_label == "response_2":
+        return 0.0, 1.0, 0.0
+    return 0.0, 0.0, 1.0

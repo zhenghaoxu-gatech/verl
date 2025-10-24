@@ -119,7 +119,7 @@ def compute_binary_reward(data_source, solution_str, ground_truth, extra_info):
     if matched:
         reward = 1.0
     elif predicted == "tie":
-        reward = 0.5
+        reward = 1.0 if canonical_gt == "tie" else 0.5
     else:
         reward = 0.0
 
