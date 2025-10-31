@@ -163,6 +163,7 @@ class ActorConfig(BaseConfig):
             "token-mean",
             "seq-mean-token-sum",
             "seq-mean-token-mean",
+            "seq-mean-token-mean-norm",
             "seq-mean-token-sum-norm",
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:

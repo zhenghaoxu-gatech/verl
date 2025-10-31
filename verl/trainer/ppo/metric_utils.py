@@ -215,6 +215,16 @@ def compute_data_metrics(
             seq_rewards = seq_rewards[non_aborted_mask].float()
             seq_values = seq_values[non_aborted_mask].float()
 
+            # Sanitize to ensure calibration metrics remain finite.
+            seq_values = torch.nan_to_num(seq_values, nan=0.0)
+            seq_rewards = torch.nan_to_num(seq_rewards, nan=0.0)
+            nan_count = (
+                torch.isnan(seq_values).sum()
+                + torch.isinf(seq_values).sum()
+                + torch.isnan(seq_rewards).sum()
+                + torch.isinf(seq_rewards).sum()
+            ).item()
+
             if seq_rewards.numel() > 0:
                 loss_type = str(value_loss_type).lower() if value_loss_type is not None else "squared"
 
@@ -319,6 +329,7 @@ def compute_data_metrics(
 
                 calibration_metrics.update(
                     {
+                        "critic/value_calibration/nan_count": float(nan_count),
                         "critic/value_calibration/sample_brier": torch.mean(observed_diff.square()).detach().item(),
                         "critic/value_calibration/sample_mae": torch.mean(observed_diff.abs()).detach().item(),
                     }
