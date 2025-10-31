@@ -156,7 +156,7 @@ python -m recipe.dapo.main_dapo \
     critic.use_dynamic_bsz=True \
     critic.ppo_max_token_len_per_gpu=${CRITIC_PPO_MAX_TOKEN_LEN_PER_GPU} \
     +critic.ppo_infer_max_token_len_per_gpu=${CRITIC_PPO_INFER_MAX_TOKEN_LEN_PER_GPU} \
-    critic.optim.lr=5e-6 \
+    critic.optim.lr=2e-6 \
     reward_model.reward_manager=dapo \
     reward_model.overlong_buffer.enable=${OVERLONG_BUFFER_ENABLE} \
     reward_model.overlong_buffer.len=${OVERLONG_BUFFER_LEN} \
