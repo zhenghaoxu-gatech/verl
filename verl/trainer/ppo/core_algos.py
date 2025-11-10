@@ -43,6 +43,7 @@ PolicyLossFn = Callable[
         str,  # loss_agg_mode
         Optional[DictConfig | AlgoConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
+        dict[str, Any] | None,  # extra loss kwargs
     ],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]
@@ -859,6 +860,7 @@ def compute_policy_loss(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -952,6 +954,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1058,6 +1061,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1124,6 +1128,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1153,6 +1158,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1248,6 +1254,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1320,6 +1327,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -1391,6 +1399,7 @@ def compute_policy_loss_pmd(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute Policy Mirror Descent (PMD) loss.
@@ -1462,6 +1471,7 @@ def compute_policy_loss_pmd_token(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute Policy Mirror Descent (PMD) token-level loss.
@@ -1483,6 +1493,76 @@ def compute_policy_loss_pmd_token(
     normalized_advs = advantages / response_lengths.unsqueeze(1)
     token_loss = ((normalized_advs - pmd_tau * (log_prob - old_log_prob))**2) / pmd_tau
     pg_loss = agg_loss(loss_mat=token_loss, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+    
+    # Compute KL for monitoring (sequence-level to match loss)
+    seq_kl = -(seq_log_prob - seq_old_log_prob) / response_lengths  # Normalize by length
+    ppo_kl = torch.mean(seq_kl)
+    
+    # PMD doesn't use clipping, so clipfracs are zero
+    pg_clipfrac = torch.tensor(0.0, device=pg_loss.device)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+    
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss("wpmd")
+def compute_policy_loss_wpmd(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_log_probs: torch.Tensor | None = None,
+    extra_loss_kwargs: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Weighted PMD.
+    
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "seq-mean-token-mean".
+        config: Actor configuration containing pmd_tau parameter
+        rollout_log_probs: Not used in PMD
+            
+    Returns:
+        tuple: (pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower)
+            pg_clipfrac and pg_clipfrac_lower are set to 0.0 as PMD doesn't use clipping
+    """
+    assert config is not None
+    assert not isinstance(config, AlgoConfig), "passing AlgoConfig not supported yet"
+    
+    # Get PMD-specific hyperparameters
+    pmd_tau = config.policy_loss.get("pmd_tau", 0.01) if hasattr(config, "policy_loss") and config.policy_loss is not None else 0.01
+    
+    # Compute sequence-level quantities
+    # For PMD, we work at sequence level: sum over tokens, then mean over batch
+    response_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)  # (batch_size,)
+    
+    # Sequence-level log probabilities: sum over tokens
+    seq_log_prob = torch.sum(log_prob * response_mask, dim=-1)  # (batch_size,)
+    seq_old_log_prob = torch.sum(old_log_prob * response_mask, dim=-1)  # (batch_size,)
+    
+    # Sequence-level advantages and weights
+    seq_advantages = torch.sum(advantages * response_mask, dim=-1) / response_lengths  # (batch_size,)
+    if extra_loss_kwargs is None or "partition_weights" not in extra_loss_kwargs:
+        raise ValueError("Weighted PMD loss requires 'partition_weights' provided via extra_loss_kwargs.")
+    partition_weights = extra_loss_kwargs["partition_weights"]
+    seq_partition_weights = torch.sum(partition_weights * response_mask, dim=-1) / response_lengths  # (batch_size,)
+    
+    # MSE term in Eq. (3), https://arxiv.org/pdf/2501.12599
+    # Scale by max response length to normalize loss magnitude
+    max_response_length = response_mask.shape[1]
+    weighted_loss = torch.mean(seq_partition_weights * (seq_advantages - pmd_tau * (seq_log_prob - seq_old_log_prob))**2)
+    pg_loss = weighted_loss / max_response_length / (pmd_tau**2)
     
     # Compute KL for monitoring (sequence-level to match loss)
     seq_kl = -(seq_log_prob - seq_old_log_prob) / response_lengths  # Normalize by length

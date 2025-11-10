@@ -40,6 +40,7 @@ from verl.trainer.ppo.ray_trainer import (
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask,
+    compute_wpmd_weight,
 )
 from verl.utils.profiler import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
@@ -315,6 +316,16 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
+                        )
+                    
+                    # compute weights for weighted PMD
+                    if (
+                        self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "wpmd"
+                        and self.config.algorithm.adv_estimator == AdvantageEstimator.PARTITION
+                    ):
+                        batch = compute_wpmd_weight(
+                            batch,
                             config=self.config.algorithm,
                         )
 

@@ -314,6 +314,8 @@ class MegatronPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if self.config.policy_loss.get("loss_mode", "vanilla") == "wpmd":
+            select_keys.append("partition_weights")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -434,6 +436,15 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
+                extra_loss_kwargs = None
+                if loss_mode == "wpmd":
+                    partition_weights = data.get("partition_weights", None)
+                    if partition_weights is None:
+                        raise ValueError(
+                            "Weighted PMD loss requires 'partition_weights' in the actor batch. "
+                            "Ensure the trainer computed wpmd weights."
+                        )
+                    extra_loss_kwargs = {"partition_weights": partition_weights}
                 pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
@@ -441,6 +452,8 @@ class MegatronPPOActor(BasePPOActor):
                     response_mask=response_mask,
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
+                    rollout_log_probs=None,
+                    extra_loss_kwargs=extra_loss_kwargs,
                 )
 
                 stats.update(
