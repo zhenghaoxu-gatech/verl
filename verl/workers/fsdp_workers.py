@@ -311,9 +311,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
 
+        vllm_dtype = PrecisionType.to_dtype(self.config.rollout.dtype)
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            torch_dtype = torch.float32 if self._is_actor else vllm_dtype
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
@@ -447,7 +448,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            param_dtype = torch.bfloat16
+            param_dtype = PrecisionType.to_dtype(self.config.actor.get("dtype", "float16"))
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
@@ -1081,6 +1082,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_states(self):
+        """Reset optimizer states (momentum, Adam moments) across all workers."""
+        assert self._is_actor, "reset_optimizer_states is only supported for Actor workers"
+        for group in self.actor_optimizer.param_groups:
+            capturable = group.get("capturable", False)
+            fused = group.get("fused", False)
+            for p in group["params"]:
+                state = self.actor_optimizer.state[p]
+                if not state:
+                    continue
+                if "exp_avg" in state:
+                    state["exp_avg"].zero_()
+                    print(f"[INFO] Optimizer states reset: exp_avg")
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"].zero_()
+                    print(f"[INFO] Optimizer states reset: exp_avg_sq")
+                if "max_exp_avg_sq" in state:
+                    state["max_exp_avg_sq"].zero_()
+                    print(f"[INFO] Optimizer states reset: max_exp_avg_sq")
+                if "step" in state:
+                    step = state["step"]
+                    if isinstance(step, torch.Tensor):
+                        step.zero_()
+                    else:
+                        device = p.device if (capturable or fused) else torch.device("cpu")
+                        state["step"] = torch.zeros((), dtype=torch.float32, device=device)
+                    print(f"[INFO] Optimizer states reset: step")
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+                    print(f"[INFO] Optimizer states reset: momentum_buffer")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:

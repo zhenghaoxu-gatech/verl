@@ -535,6 +535,40 @@ class FSDPEngine(BaseEngine):
         lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
         return lr
 
+    def reset_optimizer_states(self):
+        """
+        Reset optimizer momentum and state buffers (Adam moments, etc.)
+        """
+        for group in self.optimizer.param_groups:
+            capturable = group.get("capturable", False)
+            fused = group.get("fused", False)
+            for p in group["params"]:
+                state = self.optimizer.state[p]
+                if not state:
+                    continue
+                # Reset Adam/AdamW state
+                if "exp_avg" in state:
+                    state["exp_avg"].zero_()
+                    print(f"[INFO] Optimizer states reset: exp_avg")
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"].zero_()
+                    print(f"[INFO] Optimizer states reset: exp_avg_sq")
+                if "max_exp_avg_sq" in state:
+                    state["max_exp_avg_sq"].zero_()
+                    print(f"[INFO] Optimizer states reset: max_exp_avg_sq")
+                if "step" in state:
+                    step = state["step"]
+                    if isinstance(step, torch.Tensor):
+                        step.zero_()
+                    else:
+                        device = p.device if (capturable or fused) else torch.device("cpu")
+                        state["step"] = torch.zeros((), dtype=torch.float32, device=device)
+                    print(f"[INFO] Optimizer states reset: step")
+                # Reset SGD momentum
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+                    print(f"[INFO] Optimizer states reset: momentum_buffer")
+
     def to(self, device: str, model: bool = True, optimizer: bool = True):
         """
         Move FSDP model and/or optimizer to CPU or GPU with offload support.

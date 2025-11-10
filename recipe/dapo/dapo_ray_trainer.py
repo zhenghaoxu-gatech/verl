@@ -315,6 +315,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
                         )
 
                     # update critic
@@ -384,6 +385,12 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                # Reset optimizer states if configured
+                reset_freq = self.config.actor_rollout_ref.actor.get("reset_optimizer_states_freq", 0)
+                if reset_freq > 0 and self.global_steps % reset_freq == 0:
+                    self.actor_rollout_wg.reset_optimizer_states()
+                    print(f"[INFO] Reset optimizer states at global step {self.global_steps}")
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

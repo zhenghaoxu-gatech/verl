@@ -1276,6 +1276,18 @@ class RayPPOTrainer:
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
+                
+                # Reset optimizer states if configured
+                reset_freq = self.config.actor_rollout_ref.actor.get("reset_optimizer_states_freq", 0)
+                if reset_freq > 0 and self.global_steps % reset_freq == 0:
+                    self.actor_rollout_wg.reset_optimizer_states()
+                    if (
+                        torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        and torch.distributed.get_rank() == 0
+                    ):
+                        print(f"[INFO] Reset optimizer states at global step {self.global_steps}")
+                
                 self.global_steps += 1
 
                 if (

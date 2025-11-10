@@ -82,6 +82,12 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+        assert self.config.dtype in ["float16", "float32", "bfloat16"]
+        if self.config.dtype == "float16":
+            from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
+            self.scaler = ShardedGradScaler(growth_interval=400)
+        else:
+            self.scaler = None
 
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
@@ -98,7 +104,9 @@ class DataParallelPPOActor(BasePPOActor):
 
             multi_modal_inputs = extract_multi_modal_inputs(micro_batch["multi_modal_inputs"])
 
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+        from verl.utils.torch_dtypes import PrecisionType
+        torch_dtype = PrecisionType.to_dtype(self.config.dtype)
+        with torch.autocast(device_type=self.device_name, dtype=torch_dtype):
             input_ids = micro_batch["input_ids"]
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
@@ -272,9 +280,49 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def _reset_optimizer_states(self):
+        """Reset optimizer momentum/state buffers to zero."""
+        for group in self.actor_optimizer.param_groups:
+            capturable = group.get("capturable", False)
+            fused = group.get("fused", False)
+            for p in group["params"]:
+                state = self.actor_optimizer.state[p]
+                if not state:
+                    continue
+                # Reset Adam/AdamW state
+                if "exp_avg" in state:
+                    state["exp_avg"].zero_()
+                    print(f"[INFO] Optimizer states reset: exp_avg")
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"].zero_()
+                    print(f"[INFO] Optimizer states reset: exp_avg_sq")
+                if "max_exp_avg_sq" in state:
+                    state["max_exp_avg_sq"].zero_()
+                    print(f"[INFO] Optimizer states reset: max_exp_avg_sq")
+                if "step" in state:
+                    step = state["step"]
+                    if isinstance(step, torch.Tensor):
+                        step.zero_()
+                    else:
+                        device = p.device if (capturable or fused) else torch.device("cpu")
+                        state["step"] = torch.zeros((), dtype=torch.float32, device=device)
+                    print(f"[INFO] Optimizer states reset: step")
+                # Reset SGD momentum
+                if "momentum_buffer" in state:
+                    state["momentum_buffer"].zero_()
+                    print(f"[INFO] Optimizer states reset: momentum_buffer")
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+        ):
+            print(f"[INFO] Optimizer states reset at current training step")
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
+        if self.scaler is not None:
+            self.scaler.unscale_(self.actor_optimizer)
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         elif isinstance(self.actor_module, FSDPModule):
@@ -289,8 +337,17 @@ class DataParallelPPOActor(BasePPOActor):
         if not torch.isfinite(grad_norm):
             print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
+        elif self.scaler is not None:
+            self.scaler.step(self.actor_optimizer)
+            self.scaler.update()
         else:
-            self.actor_optimizer.step()
+            # if grad_norm is not finite, skip the update
+            if not torch.isfinite(grad_norm):
+                print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
+                self.actor_optimizer.zero_grad()
+            else:
+                self.actor_optimizer.step()
+
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -475,8 +532,11 @@ class DataParallelPPOActor(BasePPOActor):
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
                     else:
-                        loss = policy_loss * loss_scale_factor
-                    loss.backward()
+                        loss = policy_loss / self.gradient_accumulation
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
 
                     micro_batch_metrics.update(
                         {
@@ -493,3 +553,7 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    def reset_optimizer_states(self):
+        """Public method to reset optimizer states. Called from trainer."""
+        self._reset_optimizer_states()

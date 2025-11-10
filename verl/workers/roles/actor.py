@@ -182,3 +182,8 @@ class ActorWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_states(self):
+        """Reset optimizer states (momentum, Adam moments) across all workers."""
+        return self.engine.reset_optimizer_states()
