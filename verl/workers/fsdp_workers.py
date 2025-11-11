@@ -1087,6 +1087,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def reset_optimizer_states(self):
         """Reset optimizer states (momentum, Adam moments) across all workers."""
         assert self._is_actor, "reset_optimizer_states is only supported for Actor workers"
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            print(f"[INFO] Optimizer reloading for reset")
         for group in self.actor_optimizer.param_groups:
             capturable = group.get("capturable", False)
             fused = group.get("fused", False)
@@ -1114,6 +1117,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if "momentum_buffer" in state:
                     state["momentum_buffer"].zero_()
                     print(f"[INFO] Optimizer states reset: momentum_buffer")
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def start_profile(self, **kwargs) -> None:
