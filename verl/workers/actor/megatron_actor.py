@@ -314,7 +314,7 @@ class MegatronPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
-        if self.config.policy_loss.get("loss_mode", "vanilla") == "wpmd":
+        if self.config.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]:
             select_keys.append("partition_weights")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -437,7 +437,7 @@ class MegatronPPOActor(BasePPOActor):
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
                 extra_loss_kwargs = None
-                if loss_mode == "wpmd":
+                if loss_mode in ["wpmd", "apmd"]:
                     partition_weights = data.get("partition_weights", None)
                     if partition_weights is None:
                         raise ValueError(

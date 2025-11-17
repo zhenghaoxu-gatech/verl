@@ -437,7 +437,7 @@ class DataParallelPPOActor(BasePPOActor):
                 "and is not currently supported in Server mode (agent loop)."
             )
             select_keys.append("rollout_log_probs")
-        if self.config.policy_loss.get("loss_mode", "vanilla") == "wpmd": 
+        if self.config.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]: 
             select_keys.append("partition_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -500,7 +500,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    if loss_mode == "wpmd":
+                    if loss_mode in ["wpmd", "apmd"]:
                         partition_weights = model_inputs.get("partition_weights")
                         if partition_weights is None:
                             raise ValueError(

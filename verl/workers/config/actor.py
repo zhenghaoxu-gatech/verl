@@ -43,6 +43,7 @@ class PolicyLossConfig(BaseConfig):
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         pmd_tau (float): Temperature parameter for Policy Mirror Descent KL regularization.
+        pmd_alpha (float): Alpha parameter for alpha-Divergence PMD variants.
     """
 
     loss_mode: str = "vanilla"
@@ -52,6 +53,7 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     pmd_tau: float = 0.01
+    pmd_alpha: float = 1.0
 
 
 @dataclass

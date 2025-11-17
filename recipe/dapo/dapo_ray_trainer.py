@@ -321,7 +321,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     
                     # compute weights for weighted PMD
                     if (
-                        self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") == "wpmd"
+                        self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]
                         and self.config.algorithm.adv_estimator == AdvantageEstimator.PARTITION
                     ):
                         batch = compute_wpmd_weight(

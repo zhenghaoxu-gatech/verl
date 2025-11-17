@@ -25,6 +25,7 @@ USE_CRITIC=${USE_CRITIC:-True}
 ACTOR_DTYPE=${ACTOR_DTYPE:-"bfloat16"}
 ROLLOUT_DTYPE=${ROLLOUT_DTYPE:-"bfloat16"}
 PMD_TAU=${PMD_TAU:-0.1}
+PMD_ALPHA=${PMD_ALPHA:-1.0}
 RESET_OPTIMIZER_FREQ=${RESET_OPTIMIZER_FREQ:-0}
 PPO_EPOCHS=${PPO_EPOCHS:-1}
 
@@ -92,6 +93,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${SP_SIZE:-1} \
     actor_rollout_ref.actor.policy_loss.loss_mode=${POLICY_LOSS_MODE} \
     +actor_rollout_ref.actor.policy_loss.pmd_tau=${PMD_TAU} \
+    +actor_rollout_ref.actor.policy_loss.pmd_alpha=${PMD_ALPHA} \
     +actor_rollout_ref.actor.reset_optimizer_states_freq=${RESET_OPTIMIZER_FREQ} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=16 \
