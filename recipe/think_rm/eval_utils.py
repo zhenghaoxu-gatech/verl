@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -14,7 +15,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import requests
@@ -72,10 +73,13 @@ class PairSample:
     total_completions: int = 1
     actor_score: float | None = None
     corrected_score: float | None = None
+    actor_seq_confidence: float | None = None
+    actor_token_confidence: float | None = None
 
     actor_output: str | None = None
     predicted_label: str | None = None
     critic_prob: float | None = None
+    critic_logit: float | None = None
     corrected_label: str | None = None
 
     request_text: str | None = None
@@ -90,6 +94,198 @@ class PairSample:
     @property
     def prompt_key(self) -> str:
         return make_prompt_key(self.subset, self.prompt_id, self.row_index, self.base_pair_id, self.pair_index)
+
+
+def _preference_to_label_char(label: str | None) -> str | None:
+    if label is None:
+        return None
+    lookup = {
+        "response_1": "1",
+        "response_2": "2",
+        "tie": "0",
+    }
+    return lookup.get(label)
+
+
+def _sequence_confidence_from_logprobs(logprobs: Sequence[float | None]) -> float | None:
+    values = [float(lp) for lp in logprobs if lp is not None]
+    if not values:
+        return None
+    avg_logprob = sum(values) / len(values)
+    return float(math.exp(avg_logprob))
+
+
+def _find_subsequence(sequence: Sequence[int], pattern: Sequence[int]) -> int:
+    if not pattern or len(pattern) > len(sequence):
+        return -1
+    for start in range(len(sequence) - len(pattern) + 1):
+        if list(sequence[start : start + len(pattern)]) == list(pattern):
+            return start
+    return -1
+
+
+def _find_last_subsequence(sequence: Sequence[int], pattern: Sequence[int]) -> int:
+    if not pattern or len(pattern) > len(sequence):
+        return -1
+    for start in range(len(sequence) - len(pattern), -1, -1):
+        if list(sequence[start : start + len(pattern)]) == list(pattern):
+            return start
+    return -1
+
+
+def _extract_primary_logprob(entry: Any) -> float | None:
+    if entry is None:
+        return None
+    if isinstance(entry, (float, int)):
+        return float(entry)
+    if isinstance(entry, dict):
+        if "logprob" in entry and isinstance(entry["logprob"], (float, int)):
+            return float(entry["logprob"])
+        for value in entry.values():
+            candidate = _extract_primary_logprob(value)
+            if candidate is not None:
+                return candidate
+        return None
+    logprob = getattr(entry, "logprob", None)
+    if isinstance(logprob, (float, int)):
+        return float(logprob)
+    if isinstance(entry, Sequence) and entry:
+        # Some implementations return list of (token, logprob) pairs or single values.
+        first = entry[0]
+        return _extract_primary_logprob(first)
+    return None
+
+
+def _label_confidence_from_ids(
+    token_ids: Sequence[int],
+    logprobs: Sequence[float | None],
+    tokenizer: AutoTokenizer,
+    label_char: str,
+) -> float | None:
+    if not token_ids:
+        return None
+
+    label_tokens = tokenizer.encode(label_char, add_special_tokens=False)
+    pattern = tokenizer.encode(f"<label>{label_char}</label>", add_special_tokens=False)
+
+    candidate_idx = -1
+    if pattern:
+        start = _find_last_subsequence(token_ids, pattern)
+        if start != -1:
+            offset = _find_subsequence(pattern, label_tokens) if label_tokens else -1
+            if offset != -1:
+                candidate_idx = start + offset
+    if candidate_idx == -1 and label_tokens:
+        candidate_idx = _find_last_subsequence(token_ids, label_tokens)
+
+    if candidate_idx == -1 or candidate_idx >= len(logprobs):
+        return None
+
+    logprob = logprobs[candidate_idx]
+    if logprob is None:
+        return None
+    return float(math.exp(logprob))
+
+
+def _label_confidence_from_tokens(
+    tokens: Sequence[str],
+    logprobs: Sequence[float | None],
+    label_char: str,
+) -> float | None:
+    limit = min(len(tokens), len(logprobs))
+    label_char = label_char.strip()
+    for idx in range(limit - 1, -1, -1):
+        token = tokens[idx]
+        if token is None:
+            continue
+        if token.strip() != label_char:
+            continue
+        context = "".join(t or "" for t in tokens[max(0, idx - 4) : idx]).lower()
+        if "label" not in context:
+            continue
+        logprob = logprobs[idx]
+        if logprob is None:
+            continue
+        return float(math.exp(logprob))
+    return None
+
+
+def compute_actor_confidences_from_vllm(
+    output: Any,
+    tokenizer: AutoTokenizer,
+    predicted_label: str | None,
+) -> tuple[float | None, float | None]:
+    outputs = getattr(output, "outputs", None)
+    if not outputs:
+        return None, None
+    first = outputs[0]
+    logprob_entries = getattr(first, "logprobs", None)
+    token_ids = getattr(first, "token_ids", None)
+    if not logprob_entries:
+        return None, None
+
+    logprob_values: list[float | None] = [_extract_primary_logprob(entry) for entry in logprob_entries]
+    seq_conf = _sequence_confidence_from_logprobs(logprob_values)
+
+    label_char = _preference_to_label_char(predicted_label)
+    if label_char is None or not token_ids:
+        return seq_conf, None
+
+    token_conf = _label_confidence_from_ids(token_ids, logprob_values, tokenizer, label_char)
+    return seq_conf, token_conf
+
+
+def compute_actor_confidences_from_openai_payload(
+    payload: Mapping[str, Any] | None,
+    predicted_label: str | None,
+) -> tuple[float | None, float | None]:
+    if not payload:
+        return None, None
+    tokens = payload.get("tokens") or []
+    token_logprobs = payload.get("token_logprobs") or []
+    if not tokens or not token_logprobs:
+        return None, None
+    logprob_values: list[float | None] = [
+        float(lp) if isinstance(lp, (float, int)) else None for lp in token_logprobs
+    ]
+    seq_conf = _sequence_confidence_from_logprobs(logprob_values)
+    label_char = _preference_to_label_char(predicted_label)
+    if label_char is None:
+        return seq_conf, None
+    token_conf = _label_confidence_from_tokens(tokens, logprob_values, label_char)
+    return seq_conf, token_conf
+
+
+def get_primary_actor_confidence(sample: PairSample) -> float | None:
+    if sample.actor_token_confidence is not None:
+        value = float(sample.actor_token_confidence)
+        if not math.isnan(value):
+            return value
+    if sample.actor_seq_confidence is not None:
+        value = float(sample.actor_seq_confidence)
+        if not math.isnan(value):
+            return value
+    if sample.actor_score is not None:
+        value = float(sample.actor_score)
+        if not math.isnan(value):
+            return value
+    return None
+
+
+def estimate_actor_probability(sample: PairSample) -> float:
+    conf = get_primary_actor_confidence(sample)
+    if conf is not None:
+        if conf < 0.0:
+            return 0.0
+        if conf > 1.0:
+            return 1.0
+        return conf
+    predicted = sample.predicted_label
+    if predicted == "response_1":
+        return 1.0
+    if predicted == "response_2":
+        return 0.0
+    return 0.5
 
 
 def make_prompt_key(
@@ -666,6 +862,9 @@ def run_actor_generation_vllm_local(
         for sample, output in zip(batch, outputs):
             generated_text = output.outputs[0].text if output.outputs else ""
             _finalize_actor_output(sample, generated_text, actor_tokenizer)
+            seq_conf, token_conf = compute_actor_confidences_from_vllm(output, actor_tokenizer, sample.predicted_label)
+            sample.actor_seq_confidence = seq_conf
+            sample.actor_token_confidence = token_conf
 
 
 def start_vllm_server(
@@ -675,6 +874,9 @@ def start_vllm_server(
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+    
+    if "CUDA_VISIBLE_DEVICES" not in env and data_parallel_size > 1:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(data_parallel_size))
 
     cmd = [
         sys.executable,
@@ -737,13 +939,14 @@ def run_actor_generation_vllm_server(
     url = f"http://127.0.0.1:{port}/v1/completions"
     concurrency = max(1, min(concurrency, len(samples)))
 
-    def submit_request(idx: int) -> tuple[int, str]:
+    def submit_request(idx: int) -> tuple[int, str, Mapping[str, Any] | None]:
         prompt = prompts[idx]
         payload = {
             "model": model_name,
             "prompt": prompt,
             "max_tokens": max_new_tokens,
             "stream": False,
+            "logprobs": 1,
         }
         last_exc: Exception | None = None
         for attempt in range(3):
@@ -757,7 +960,7 @@ def run_actor_generation_vllm_server(
                     message = choice["message"]
                     if isinstance(message, dict):
                         text = message.get("content", "")
-                return idx, (text or "")
+                return idx, (text or ""), choice.get("logprobs")
             except Exception as exc:
                 last_exc = exc
                 time.sleep(2)
@@ -771,9 +974,15 @@ def run_actor_generation_vllm_server(
             desc="Actor generation (vLLM server)",
             unit="pair",
         ):
-            idx, text = future.result()
+            idx, text, logprob_payload = future.result()
             sample = samples[idx]
             _finalize_actor_output(sample, text, actor_tokenizer)
+            seq_conf, token_conf = compute_actor_confidences_from_openai_payload(
+                logprob_payload,
+                sample.predicted_label,
+            )
+            sample.actor_seq_confidence = seq_conf
+            sample.actor_token_confidence = token_conf
 
 
 def _normalize_chat_tensor(
@@ -962,14 +1171,19 @@ def run_critic_scoring_single(
 
         last_values = _select_last_token_values(value_logits, inputs["attention_mask"])
         if outputs_logits:
-            probs = torch.sigmoid(last_values).detach().cpu().tolist()
+            logits_tensor = last_values
+            probs_tensor = torch.sigmoid(last_values)
         else:
-            probs = last_values.clamp(0.0, 1.0).detach().cpu().tolist()
-        # print('>>>>>>>>>>>> input\n', inputs, '\n>>>>>>>>>>>> critic\n', value_logits, '\n>>>>>>>>>>>>>> probs\n', probs)
-        # print('>>>>>>>>>>>> input\n', inputs['input_ids'].size(), '\n>>>>>>>>>>>> critic\n', value_logits.size(), '\n>>>>>>>>>>>>>> probs\n', probs)
+            probs_tensor = last_values.clamp(0.0, 1.0)
+            logits_tensor = torch.logit(probs_tensor.clamp(min=CRITIC_PROB_EPS, max=1.0 - CRITIC_PROB_EPS))
 
-        for sample, prob in zip(batch, probs):
-            sample.critic_prob = float(prob)
+        probs_list = probs_tensor.detach().cpu().tolist()
+        logits_list = logits_tensor.detach().cpu().tolist()
+
+        for sample, prob, logit in zip(batch, probs_list, logits_list):
+            prob_clamped = min(max(float(prob), CRITIC_PROB_EPS), 1.0 - CRITIC_PROB_EPS)
+            sample.critic_prob = prob_clamped
+            sample.critic_logit = float(logit)
 
 
 def _critic_worker_process(
@@ -1079,16 +1293,22 @@ def _critic_worker_process(
 
             last_values = _select_last_token_values(value_logits, inputs["attention_mask"])
             if outputs_logits:
-                probs = torch.sigmoid(last_values).detach().cpu().tolist()
+                logits_tensor = last_values
+                probs_tensor = torch.sigmoid(last_values)
             else:
-                probs = last_values.clamp(0.0, 1.0).detach().cpu().tolist()
+                probs_tensor = last_values.clamp(0.0, 1.0)
+                logits_tensor = torch.logit(probs_tensor.clamp(min=CRITIC_PROB_EPS, max=1.0 - CRITIC_PROB_EPS))
+
+            probs_list = probs_tensor.detach().cpu().tolist()
+            logits_list = logits_tensor.detach().cpu().tolist()
 
             queue.put(
                 {
                     "type": "result",
                     "device": device_id,
                     "indices": batch_indices,
-                    "probs": [float(prob) for prob in probs],
+                    "probs": [float(prob) for prob in probs_list],
+                    "logits": [float(logit) for logit in logits_list],
                 }
             )
             queue.put({"type": "progress", "device": device_id, "count": len(batch_indices)})
@@ -1150,8 +1370,15 @@ def run_critic_scoring_multiproc(
             elif msg_type == "result":
                 indices = message.get("indices", [])
                 probs = message.get("probs", [])
-                for idx, prob in zip(indices, probs):
-                    samples[idx].critic_prob = float(prob)
+                logits = message.get("logits", [])
+                for offset, prob in enumerate(probs):
+                    idx = indices[offset] if offset < len(indices) else None
+                    if idx is None or idx >= len(samples):
+                        continue
+                    prob_clamped = min(max(float(prob), CRITIC_PROB_EPS), 1.0 - CRITIC_PROB_EPS)
+                    samples[idx].critic_prob = prob_clamped
+                    logit_value = float(logits[offset]) if offset < len(logits) else _prob_to_logit(prob_clamped)
+                    samples[idx].critic_logit = logit_value
             elif msg_type == "error":
                 err_msg = message.get("error", "unknown error")
                 tb = message.get("traceback")
@@ -1172,14 +1399,19 @@ def run_critic_scoring_multiproc(
 def apply_correction(samples: Iterable[PairSample], threshold: float) -> None:
     for sample in samples:
         predicted = sample.predicted_label or "unknown"
+        sample.actor_score = None
         prob = sample.critic_prob
         if prob is None or predicted not in {"response_1", "response_2"}:
             sample.corrected_label = predicted
+            sample.corrected_score = _preference_probability(sample, sample.corrected_label)
             continue
+        prob = min(max(float(prob), CRITIC_PROB_EPS), 1.0 - CRITIC_PROB_EPS)
+        sample.critic_prob = prob
         if prob >= threshold:
             sample.corrected_label = predicted
         else:
             sample.corrected_label = "response_1" if predicted == "response_2" else "response_2"
+        sample.corrected_score = _preference_probability(sample, sample.corrected_label)
 
 
 def compute_prediction_distribution(samples: Iterable[PairSample], attr: str) -> dict:
@@ -1197,18 +1429,57 @@ def compute_prediction_distribution(samples: Iterable[PairSample], attr: str) ->
     return {"counts": counts, "fractions": fractions}
 
 
-def _preference_score(label: str | None, orientation: str) -> float:
+CRITIC_PROB_EPS = 1e-6
+
+
+def _position_role(sample: PairSample, index: int) -> str | None:
+    if index is None or index < 0:
+        return None
+    if sample.num_correct is not None and sample.num_correct > 0:
+        if index < sample.num_correct:
+            return "chosen"
+        if sample.total_completions is not None and sample.total_completions > 0 and index < sample.total_completions:
+            return "rejected"
+    # Fall back to comparison tags when counts are not informative.
+    kind = (sample.comparison_kind or "").lower()
+    if kind == "chosen_vs_rejected":
+        if sample.chosen_index >= 0 and index == sample.chosen_index:
+            return "chosen"
+        if sample.rejected_index >= 0 and index == sample.rejected_index:
+            return "rejected"
+    if kind in {"chosen_vs_chosen", "tie"}:
+        return "chosen"
+    if kind == "rejected_vs_rejected":
+        return "rejected"
+    return None
+
+
+def _find_pos_with_role(sample: PairSample, role: str, default: int) -> int:
+    for candidate in (sample.response_1_pos, sample.response_2_pos):
+        if _position_role(sample, candidate) == role:
+            return candidate
+    return default
+
+
+def _label_role(sample: PairSample, label: str | None) -> str | None:
     if label is None:
-        return 0.5
-    label = label.lower()
-    if label == "tie":
-        return 0.5
-    if label not in {"response_1", "response_2"}:
-        return 0.5
-    if orientation == "forward":
-        return 1.0 if label == "response_1" else 0.0
-    if orientation == "backward":
-        return 1.0 if label == "response_2" else 0.0
+        return None
+    value = label.lower()
+    if value == "response_1":
+        return _position_role(sample, sample.response_1_pos)
+    if value == "response_2":
+        return _position_role(sample, sample.response_2_pos)
+    if value in {"tie", "unknown"}:
+        return value
+    return None
+
+
+def _preference_probability(sample: PairSample, label: str | None) -> float:
+    role = _label_role(sample, label)
+    if role == "chosen":
+        return 1.0
+    if role == "rejected":
+        return 0.0
     return 0.5
 
 
@@ -1220,17 +1491,25 @@ def _score_to_label(score: float) -> str:
     return "tie"
 
 
+def _logit_to_prob(value: float) -> float:
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _prob_to_logit(prob: float) -> float:
+    clipped = min(max(prob, CRITIC_PROB_EPS), 1.0 - CRITIC_PROB_EPS)
+    return math.log(clipped / (1.0 - clipped))
+
+
 def _convert_critic_prob(sample: PairSample) -> float | None:
     if sample.critic_prob is None:
         return None
-    label = sample.predicted_label
-    if label is None or label.lower() not in {"response_1", "response_2"}:
-        return 0.5
+    role = _label_role(sample, sample.predicted_label)
     prob = float(sample.critic_prob)
-    if sample.orientation == "forward":
-        return prob if label == "response_1" else 1.0 - prob
-    if sample.orientation == "backward":
-        return prob if label == "response_2" else 1.0 - prob
+    prob = min(max(prob, CRITIC_PROB_EPS), 1.0 - CRITIC_PROB_EPS)
+    if role == "chosen":
+        return prob
+    if role == "rejected":
+        return 1.0 - prob
     return 0.5
 
 
@@ -1258,8 +1537,11 @@ def aggregate_pair_orientations(samples: list[PairSample]) -> list[PairSample]:
         prompt_text = base.prompt_text
         messages = build_prompt_messages(prompt_text, chosen, rejected)
 
-        actor_scores = [_preference_score(member.predicted_label, member.orientation) for member in members]
-        corrected_scores = [_preference_score(member.corrected_label, member.orientation) for member in members]
+        chosen_pos = _find_pos_with_role(base, "chosen", base.response_1_pos)
+        rejected_pos = _find_pos_with_role(base, "rejected", base.response_2_pos)
+
+        actor_scores = [_preference_probability(member, member.predicted_label) for member in members]
+        corrected_scores = [_preference_probability(member, member.corrected_label) for member in members]
         critic_scores = [score for member in members if (score := _convert_critic_prob(member)) is not None]
 
         actor_avg = sum(actor_scores) / len(actor_scores) if actor_scores else 0.5
@@ -1286,15 +1568,18 @@ def aggregate_pair_orientations(samples: list[PairSample]) -> list[PairSample]:
             total_completions=base.total_completions,
             actor_score=actor_avg,
             corrected_score=corrected_avg,
-            response_1_pos=base.response_1_pos,
-            response_2_pos=base.response_2_pos,
+            response_1_pos=chosen_pos,
+            response_2_pos=rejected_pos,
             comparison_kind=base.comparison_kind,
         )
 
         agg_sample.predicted_label = _score_to_label(actor_avg)
         agg_sample.corrected_label = _score_to_label(corrected_avg)
         if critic_scores:
-            agg_sample.critic_prob = float(sum(critic_scores) / len(critic_scores))
+            critic_logits = [_prob_to_logit(score) for score in critic_scores]
+            logit_avg = sum(critic_logits) / len(critic_logits)
+            agg_sample.critic_logit = float(logit_avg)
+            agg_sample.critic_prob = float(_logit_to_prob(logit_avg))
         if members[0].actor_output:
             agg_sample.actor_output = members[0].actor_output
         agg_sample.request_text = members[0].request_text
@@ -1306,15 +1591,11 @@ def aggregate_pair_orientations(samples: list[PairSample]) -> list[PairSample]:
 
 
 def _label_to_choice(sample: PairSample, label: str | None) -> str | None:
-    if label is None:
-        return None
-    label = label.lower()
-    if label not in {"response_1", "response_2"}:
-        return label if label in {"tie", "unknown"} else None
-    if sample.orientation == "forward":
-        return "chosen" if label == "response_1" else "rejected"
-    if sample.orientation == "backward":
-        return "rejected" if label == "response_1" else "chosen"
+    role = _label_role(sample, label)
+    if role in {"chosen", "rejected"}:
+        return role
+    if role in {"tie", "unknown"}:
+        return role
     return None
 
 
@@ -1361,6 +1642,7 @@ def build_pair_level_results(samples: Iterable[PairSample]) -> list[dict[str, An
                     "actor_choice": actor_choice_single,
                     "critic_choice": critic_choice_single,
                     "critic_prob": member.critic_prob,
+                    "critic_logit": member.critic_logit,
                 }
             )
 
@@ -1403,8 +1685,11 @@ def save_request_generations(samples: Iterable[PairSample], path: Path) -> None:
                 "predicted_label": sample.predicted_label,
                 "corrected_label": sample.corrected_label,
                 "actor_score": sample.actor_score,
+                "actor_seq_confidence": sample.actor_seq_confidence,
+                "actor_token_confidence": sample.actor_token_confidence,
                 "corrected_score": sample.corrected_score,
                 "critic_prob": sample.critic_prob,
+                "critic_logit": sample.critic_logit,
                 "request_text": sample.request_text,
                 "actor_output": sample.actor_output,
                 "full_token_ids": sample.full_token_ids,
@@ -1546,4 +1831,41 @@ def summarize_prompt_statuses(results: Iterable[dict[str, Any]]) -> dict[str, An
     return {
         "overall": overall_summary,
         "subsets": subset_summary,
+    }
+
+
+def _slugify_identifier(value: str | Path | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(os.sep, "-").replace("/", "-")
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
+    text = text.strip("-.")
+    return text or None
+
+
+def derive_run_name(actor_ref: str | Path | None, checkpoint_dir: Path | None) -> str | None:
+    candidates = [actor_ref, checkpoint_dir.name if checkpoint_dir else None]
+    for candidate in candidates:
+        slug = _slugify_identifier(candidate)
+        if slug:
+            return slug
+    return None
+
+
+def resolve_output_artifacts(output_dir: Path, results_filename: str, run_name: str | None = None) -> dict[str, Path]:
+    safe_run = _slugify_identifier(run_name)
+    filename = Path(results_filename).name
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".json"
+    prefix = f"{safe_run}_" if safe_run else ""
+    metrics_path = output_dir / f"{prefix}{stem}{suffix}"
+    pair_path = output_dir / f"{prefix}{stem}_pairs.jsonl"
+    generations_path = output_dir / f"{prefix}{stem}_generations.jsonl"
+    return {
+        "metrics": metrics_path,
+        "pairs": pair_path,
+        "generations": generations_path,
     }

@@ -277,6 +277,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
+                        assert self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") not in ["cmdpo"], (
+                            "CMDPO is not compatible with balance_batch. "
+                            "Please set balance_batch=False or use vanilla policy loss."
+                        )
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
@@ -320,14 +324,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                         )
                     
                     # compute weights for weighted PMD
-                    if (
-                        self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]
-                        and self.config.algorithm.adv_estimator == AdvantageEstimator.PARTITION
-                    ):
-                        batch = compute_wpmd_weight(
-                            batch,
-                            config=self.config.algorithm,
-                        )
+                        if (
+                            self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]
+                            and self.config.algorithm.adv_estimator in [AdvantageEstimator.PARTITION, AdvantageEstimator.PLOO]
+                        ):
+                            batch = compute_wpmd_weight(batch, use_is=True, config=self.config.algorithm)
+                        elif self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") in ["opmd"]:
+                            batch = compute_wpmd_weight(batch, use_is=False, config=self.config.algorithm)
 
                     # update critic
                     if self.use_critic:

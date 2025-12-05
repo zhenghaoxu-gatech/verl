@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 
 DATA_ROOT=${DATA_ROOT:-${HOME}/data/think_rm}
 TRAIN_PARQUET=${TRAIN_PARQUET:-${DATA_ROOT}/rl/train.parquet}
@@ -19,6 +19,8 @@ LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token"}
 BASE_MODEL_NAME=${BASE_MODEL_NAME:-"Qwen/Qwen3-4B-Thinking-2507"}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 USE_CRITIC=${USE_CRITIC:-True}
+ACTOR_DTYPE=${ACTOR_DTYPE:-"bfloat16"}
+ROLLOUT_DTYPE=${ROLLOUT_DTYPE:-"bfloat16"}
 
 cd "${REPO_ROOT}"
 
@@ -52,6 +54,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE} \
+    actor_rollout_ref.actor.dtype=${ACTOR_DTYPE} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${SP_SIZE:-1} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=4 \
@@ -66,6 +69,7 @@ ray job submit --address="http://127.0.0.1:8265" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.max_num_seqs=1024 \
+    actor_rollout_ref.rollout.dtype=${ROLLOUT_DTYPE} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.fsdp_config.optimizer_offload=True \

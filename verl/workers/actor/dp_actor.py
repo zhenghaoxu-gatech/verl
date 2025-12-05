@@ -437,11 +437,13 @@ class DataParallelPPOActor(BasePPOActor):
                 "and is not currently supported in Server mode (agent loop)."
             )
             select_keys.append("rollout_log_probs")
-        if self.config.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]: 
+        if self.config.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd", "opmd"]: 
             select_keys.append("partition_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        if self.config.policy_loss.get("loss_mode", "vanilla") in ["cmdpo"]: 
+            non_tensor_select_keys.append("uid")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -455,6 +457,9 @@ class DataParallelPPOActor(BasePPOActor):
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
+                    assert self.config.policy_loss.get("loss_mode", "vanilla") not in ["cmdpo"], (
+                        "Dynamic batch size is not supported for CMDPO loss."
+                    )
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
@@ -500,7 +505,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
-                    if loss_mode in ["wpmd", "apmd"]:
+                    if loss_mode in ["wpmd", "apmd", "opmd"]:
                         partition_weights = model_inputs.get("partition_weights")
                         if partition_weights is None:
                             raise ValueError(
@@ -517,6 +522,25 @@ class DataParallelPPOActor(BasePPOActor):
                             rollout_log_probs=rollout_log_probs,
                             extra_loss_kwargs={
                                 "partition_weights": partition_weights,
+                            },
+                        )
+                    elif loss_mode in ["cmdpo"]:
+                        uid = model_inputs.get("uid")
+                        if uid is None:
+                            raise ValueError(
+                                "CMDPO loss requires 'uid' in the actor batch. "
+                                "Ensure the trainer computed CMDPO weights."
+                            )
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_log_probs=rollout_log_probs,
+                            extra_loss_kwargs={
+                                "uid": uid,
                             },
                         )
                     else: 

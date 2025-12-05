@@ -256,8 +256,10 @@ def compute_score(
     Returns:
         Reward score (1.0 for correct, -1.0 for incorrect)
     """
-    # Limit solution length for efficiency
-    solution_str = solution_str[-300:]  # The longest answer in MATH-500 has 159 characters
+    # Limit solution length for efficiency and to reduce reward hacking.
+    # DAPO17k ground truths are <= 23 chars; keep a small buffer for formatting + a newline.
+    max_eval_len = len(ground_truth) + 8
+    solution_str = solution_str[-max_eval_len:]
 
     # Verify the solution
     correct, pred = verify(solution_str, ground_truth, strict_box_verify, pause_tokens_index)

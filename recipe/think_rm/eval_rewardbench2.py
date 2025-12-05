@@ -27,9 +27,11 @@ from recipe.think_rm.eval_utils import (
     build_pair_level_results,
     build_prompt_messages,
     compute_prediction_distribution,
+    derive_run_name,
     ensure_hf_export,
     find_latest_checkpoint,
     load_token_classifier,
+    estimate_actor_probability,
     run_actor_generation_hf,
     run_actor_generation_vllm_local,
     run_actor_generation_vllm_server,
@@ -37,6 +39,7 @@ from recipe.think_rm.eval_utils import (
     run_critic_scoring_single,
     save_pair_level_results,
     save_request_generations,
+    resolve_output_artifacts,
     shutdown_process,
     start_vllm_server,
     summarize_pair_statuses,
@@ -48,6 +51,8 @@ try:
     import wandb
 except ImportError:  # pragma: no cover - optional dependency
     wandb = None
+
+PROB_MARGIN_EPS = 1e-6
 
 
 def _iter_combinations(length: int) -> Iterable[tuple[int, int]]:
@@ -219,11 +224,7 @@ def compute_metrics(samples: list[PairSample]) -> dict:
 
     for sample in samples:
         norm_ground_truth = sample.ground_truth or "response_1"
-        actor_score = (
-            float(sample.actor_score)
-            if sample.actor_score is not None
-            else _label_to_score(sample.predicted_label, norm_ground_truth)
-        )
+        actor_score = float(estimate_actor_probability(sample))
         critic_score: float
         if sample.corrected_score is not None:
             critic_score = float(sample.corrected_score)
@@ -269,8 +270,8 @@ def compute_metrics(samples: list[PairSample]) -> dict:
                 "pair_strict_critic": 0,
                 "pair_results_actor": [],
                 "pair_results_critic": [],
-                "scores": {name: [0.0] * total_candidates for name in ("actor", "critic", "prob")},
-                "counts": {name: [0] * total_candidates for name in ("actor", "critic", "prob")},
+                "scores": {name: [0.0] * total_candidates for name in ("actor", "critic", "prob", "prob_logit")},
+                "counts": {name: [0] * total_candidates for name in ("actor", "critic", "prob", "prob_logit")},
                 "row_index": sample.row_index,
             }
             prompt_records[prompt_key] = record
@@ -301,6 +302,7 @@ def compute_metrics(samples: list[PairSample]) -> dict:
             "critic": critic_score,
             "prob": _get_metric_value(sample, "prob"),
         }
+        prob_logit_value = _get_metric_value(sample, "prob_logit")
         for metric_name, value in metric_values.items():
             if value is None or math.isnan(value):
                 continue
@@ -312,6 +314,16 @@ def compute_metrics(samples: list[PairSample]) -> dict:
                 counts[resp1_pos] += 1
             if resp2_pos >= 0:
                 scores[resp2_pos] += 1.0 - value
+                counts[resp2_pos] += 1
+        if prob_logit_value is not None and not math.isnan(prob_logit_value):
+            logit_value = float(prob_logit_value)
+            scores = record["scores"]["prob_logit"]
+            counts = record["counts"]["prob_logit"]
+            if resp1_pos >= 0:
+                scores[resp1_pos] += logit_value
+                counts[resp1_pos] += 1
+            if resp2_pos >= 0:
+                scores[resp2_pos] += -logit_value
                 counts[resp2_pos] += 1
 
     for record in prompt_records.values():
@@ -404,7 +416,7 @@ def compute_metrics(samples: list[PairSample]) -> dict:
                     {**entry_base, "scores": record["scores"]["critic"]}
                 )
                 ties_entries_prob.append(
-                    {**entry_base, "scores": record["scores"]["prob"]}
+                    {**entry_base, "scores": record["scores"]["prob_logit"]}
                 )
 
             actor_ties_score, actor_ties_details = _compute_ties_score(ties_entries_actor)
@@ -477,11 +489,6 @@ def compute_metrics(samples: list[PairSample]) -> dict:
         "prob": _safe_mean(list(prob_leaderboard.values())),
     }
 
-    overall_prompt_accuracy = {
-        "actor_prompt_accuracy": overall_subset_average["actor"],
-        "critic_prompt_accuracy": overall_subset_average["critic"],
-    }
-
     total_pairs = counted_pairs
 
     overall_pair_metrics = {
@@ -497,7 +504,6 @@ def compute_metrics(samples: list[PairSample]) -> dict:
 
     metrics = {
         "subset_metrics": subset_summary,
-        "overall_prompt_accuracy": overall_prompt_accuracy,
         "overall_subset_average": overall_subset_average,
         "leaderboard_scores": {
             "actor": {k: v for k, v in actor_leaderboard.items() if v is not None and not math.isnan(v)},
@@ -524,17 +530,23 @@ def _label_to_score(label: str | None, positive_label: str) -> float:
 def _get_metric_value(sample: PairSample, metric: str) -> float | None:
     norm_ground_truth = sample.ground_truth or "response_1"
     if metric == "actor":
-        if sample.actor_score is not None:
-            return float(sample.actor_score)
-        return _label_to_score(sample.predicted_label, norm_ground_truth)
+        return estimate_actor_probability(sample)
     if metric == "critic":
         if sample.corrected_score is not None:
             return float(sample.corrected_score)
         return _label_to_score(sample.corrected_label, norm_ground_truth)
-    if metric in {"prob", "critic"}:
+    if metric == "prob":
         if sample.critic_prob is not None:
             return float(sample.critic_prob)
         return None
+    if metric == "prob_logit":
+        if sample.critic_logit is not None:
+            return float(sample.critic_logit)
+        if sample.critic_prob is None:
+            return None
+        prob = float(sample.critic_prob)
+        prob = float(np.clip(prob, PROB_MARGIN_EPS, 1.0 - PROB_MARGIN_EPS))
+        return float(np.log(prob / (1.0 - prob)))
     raise ValueError(f"Unknown metric type '{metric}'")
 
 
@@ -920,6 +932,8 @@ def main() -> None:
         )
         sampling_params = SamplingParams(
             max_tokens=args.max_new_tokens,
+            temperature=0.0,
+            logprobs=1,
         )
         run_actor_generation_vllm_local(actor_llm, sampling_params, actor_tokenizer, samples, args.actor_batch_size)
     else:
@@ -1002,11 +1016,15 @@ def main() -> None:
         "critic": critic_prediction_distribution,
     }
 
-    generations_path = output_dir / f"{Path(args.results_file).stem}_generations.jsonl"
+    run_name = derive_run_name(actor_model_ref, checkpoint_dir)
+    artifact_paths = resolve_output_artifacts(output_dir, args.results_file, run_name)
+    metrics_config["run_name"] = run_name
+
+    generations_path = artifact_paths["generations"]
     save_request_generations(raw_samples, generations_path)
 
     pair_results = build_pair_level_results(raw_samples)
-    pair_results_path = output_dir / f"{Path(args.results_file).stem}_pair_results.jsonl"
+    pair_results_path = artifact_paths["pairs"]
     save_pair_level_results(pair_results, pair_results_path)
     pair_status_summary = summarize_pair_statuses(pair_results)
     prompt_status_summary = summarize_prompt_statuses(pair_results)
@@ -1070,7 +1088,7 @@ def main() -> None:
 
     metrics["config"] = metrics_config
 
-    output_path = output_dir / args.results_file
+    output_path = artifact_paths["metrics"]
     save_metrics(metrics, output_path)
 
     if wandb and wandb_mode_env not in {"disabled", "off", "offline"}:
@@ -1107,6 +1125,7 @@ def main() -> None:
             ties_stats = next(
                 (stats for subset_name, stats in subset_metrics.items() if subset_name.lower() == "ties"), None
             )
+            overall_subset_average = metrics.get("overall_subset_average", {})
 
             core_payload: dict[str, float] = {}
             _maybe_add(core_payload, "rewardbench2-core/actor/prompt_strict_accuracy", actor_prompt_status.get("strict_accuracy"))
@@ -1121,6 +1140,9 @@ def main() -> None:
             _maybe_add(core_payload, "rewardbench2-core/critic/pair_consistency_rate", critic_pair_status.get("consistency_rate"))
             _maybe_add(core_payload, "rewardbench2-core/total_prompts", metrics.get("total_prompts"))
             _maybe_add(core_payload, "rewardbench2-core/total_pairs", metrics.get("total_pairs"))
+            _maybe_add(core_payload, "rewardbench2-core/actor/subset_average", overall_subset_average.get("actor"))
+            _maybe_add(core_payload, "rewardbench2-core/critic/subset_average", overall_subset_average.get("critic"))
+            _maybe_add(core_payload, "rewardbench2-core/prob/subset_average", overall_subset_average.get("prob"))
             if ties_stats:
                 _maybe_add(core_payload, "rewardbench2-core/actor/overall_score", ties_stats.get("actor_ties_score"))
                 _maybe_add(core_payload, "rewardbench2-core/critic/overall_score", ties_stats.get("critic_ties_score"))
@@ -1166,10 +1188,6 @@ def main() -> None:
             _maybe_add(aux_payload, "rewardbench2-aux/overall/actor_subset_average", subset_avg.get("actor"))
             _maybe_add(aux_payload, "rewardbench2-aux/overall/critic_subset_average", subset_avg.get("critic"))
             _maybe_add(aux_payload, "rewardbench2-aux/overall/prob_subset_average", subset_avg.get("prob"))
-
-            overall_prompt_accuracy = metrics.get("overall_prompt_accuracy", {})
-            _maybe_add(aux_payload, "rewardbench2-aux/overall/actor_prompt_accuracy", overall_prompt_accuracy.get("actor_prompt_accuracy"))
-            _maybe_add(aux_payload, "rewardbench2-aux/overall/critic_prompt_accuracy", overall_prompt_accuracy.get("critic_prompt_accuracy"))
 
             run.log(core_payload)
             if aux_payload:

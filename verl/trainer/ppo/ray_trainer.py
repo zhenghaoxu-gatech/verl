@@ -305,6 +305,7 @@ def compute_advantage(
 
 def compute_wpmd_weight(
     data: DataProto,
+    use_is: bool = False,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
     """Compute weights for weighted policy mirror descent.
@@ -324,29 +325,48 @@ def compute_wpmd_weight(
     tau = 0.01
     if config is not None:
         tau = config.get("partition_tau", tau)
-    
-    scores = token_level_rewards.sum(dim=-1)
 
-    id2score = defaultdict(list)
-    id2partition = {}
+    scores = token_level_rewards.sum(dim=-1)
+    bsz = scores.shape[0]
+
+    reward_lb = -float("inf") if config is None else config.get("partition_reward_lb", -float("inf"))
+    reward_ub = float("inf") if config is None else config.get("partition_reward_ub", float("inf"))
+    reward_lb = -float("inf") if reward_lb is None else reward_lb
+    reward_ub = float("inf") if reward_ub is None else reward_ub
+
+    id2score: dict[str, list[torch.Tensor]] = defaultdict(list)
     id2max = {}
+    id2partition = {}
+    prompt_in_range = {}
 
     with torch.no_grad():
-        bsz = scores.shape[0]
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) >= 1:
-                scores_tensor = torch.stack(id2score[idx])
-                max_score = torch.max(scores_tensor)
-                id2max[idx] = max_score
-                shifted = scores_tensor - max_score
+        for idx, score_list in id2score.items():
+            scores_tensor = torch.stack(score_list)
+            prompt_mean = torch.mean(scores_tensor)
+            # Use open interval (lb, ub) so lb=-1, ub=1 filters out prompts with all correct/incorrect.
+            prompt_in_range[idx] = ((prompt_mean > reward_lb) & (prompt_mean < reward_ub)).item()
+            if use_is:
+                id2max[idx] = torch.max(scores_tensor)
+                shifted = scores_tensor - id2max[idx]
                 id2partition[idx] = torch.mean(torch.exp(shifted / tau))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            scores[i] = torch.exp((scores[i]-id2max[index[i]]) / tau) / id2partition[index[i]]
-        partition_weights = scores.unsqueeze(-1) * response_mask
+
+        if use_is:
+            for i in range(bsz):
+                scores[i] = torch.exp((scores[i] - id2max[index[i]]) / tau) / id2partition[index[i]]
+            base_weights = scores.unsqueeze(-1)
+        else:
+            # No IS correction; use a flat weight.
+            base_weights = torch.ones_like(response_mask, dtype=token_level_rewards.dtype)
+
+        prompt_mask = torch.tensor(
+            [1.0 if prompt_in_range[index[i]] else 0.0 for i in range(bsz)],
+            device=scores.device,
+            dtype=token_level_rewards.dtype,
+        ).unsqueeze(-1)
+
+    partition_weights = base_weights * response_mask * prompt_mask
 
     data.batch["partition_weights"] = partition_weights
 
@@ -1132,6 +1152,10 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
+                        assert self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") not in ["cmdpo"], (
+                            "CMDPO is not compatible with balance_batch. "
+                            "Please set balance_batch=False or use vanilla policy loss."
+                        )
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
@@ -1216,9 +1240,12 @@ class RayPPOTrainer:
                         )
                         if (
                             self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") in ["wpmd", "apmd"]
-                            and self.config.algorithm.adv_estimator == AdvantageEstimator.PARTITION
+                            and self.config.algorithm.adv_estimator in [AdvantageEstimator.PARTITION, AdvantageEstimator.PLOO]
                         ):
-                            batch = compute_wpmd_weight(batch, config=self.config.algorithm)
+                            batch = compute_wpmd_weight(batch, use_is=True, config=self.config.algorithm)
+                        elif self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla") in ["opmd"]:
+                            batch = compute_wpmd_weight(batch, use_is=False, config=self.config.algorithm)
+                        
 
                     # update critic
                     if self.use_critic:

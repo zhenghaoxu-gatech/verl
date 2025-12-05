@@ -25,6 +25,7 @@ from recipe.think_rm.eval_utils import (
     build_pair_level_results,
     build_prompt_messages,
     compute_prediction_distribution,
+    derive_run_name,
     ensure_hf_export,
     find_latest_checkpoint,
     load_token_classifier,
@@ -35,6 +36,8 @@ from recipe.think_rm.eval_utils import (
     run_critic_scoring_single,
     save_pair_level_results,
     save_request_generations,
+    estimate_actor_probability,
+    resolve_output_artifacts,
     shutdown_process,
     start_vllm_server,
     summarize_pair_statuses,
@@ -393,10 +396,7 @@ def _aggregate_sample_records(
             },
         )
 
-        actor_score = sample.actor_score if sample.actor_score is not None else (
-            1.0 if sample.predicted_label == "response_1" else (0.0 if sample.predicted_label == "response_2" else 0.5)
-        )
-        actor_score = float(np.clip(actor_score, 0.0, 1.0))
+        actor_score = float(estimate_actor_probability(sample))
         critic_score = sample.corrected_score if sample.corrected_score is not None else actor_score
         critic_score = float(np.clip(critic_score, 0.0, 1.0))
 
@@ -573,6 +573,8 @@ def main() -> None:
         )
         sampling_params = SamplingParams(
             max_tokens=args.max_new_tokens,
+            temperature=0.0,
+            logprobs=1,
         )
         run_actor_generation_vllm_local(actor_llm, sampling_params, actor_tokenizer, pair_samples, args.actor_batch_size)
     else:
@@ -632,11 +634,14 @@ def main() -> None:
     actor_prediction_distribution = compute_prediction_distribution(aggregated_samples, "predicted_label")
     critic_prediction_distribution = compute_prediction_distribution(aggregated_samples, "corrected_label")
 
-    generations_path = output_dir / f"{Path(args.results_file).stem}_generations.jsonl"
+    run_name = derive_run_name(actor_model_ref, checkpoint_dir)
+    artifact_paths = resolve_output_artifacts(output_dir, args.results_file, run_name)
+
+    generations_path = artifact_paths["generations"]
     save_request_generations(raw_samples, generations_path)
 
     pair_results = build_pair_level_results(raw_samples)
-    pair_results_path = output_dir / f"{Path(args.results_file).stem}_pair_results.jsonl"
+    pair_results_path = artifact_paths["pairs"]
     save_pair_level_results(pair_results, pair_results_path)
     pair_status_summary = summarize_pair_statuses(pair_results)
 
@@ -655,6 +660,7 @@ def main() -> None:
         "skip_critic": args.skip_critic,
         "critic_model_ref": str(critic_export) if critic_export is not None else None,
         "critic_loss_type": args.critic_loss_type,
+        "run_name": run_name,
     }
 
     metrics_config.update(
@@ -717,7 +723,7 @@ def main() -> None:
         }
     )
 
-    output_path = output_dir / args.results_file
+    output_path = artifact_paths["metrics"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w") as fout:
         json.dump(metrics, fout, indent=2)

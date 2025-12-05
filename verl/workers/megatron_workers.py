@@ -34,6 +34,7 @@ except ImportError:
     repatch = None
 
 from megatron.core import parallel_state as mpu
+from megatron.core.optimizer import ChainedOptimizer
 
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -746,6 +747,56 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=logger)
         aggressive_empty_cache(force_sync=True)
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_states(self):
+        """Reset optimizer state (Adam moments and step) across all actor ranks."""
+        assert self._is_actor, "reset_optimizer_states is only supported for Actor workers"
+        if self.actor_optimizer is None:
+            return
+
+        def _iter_opts(opt):
+            if isinstance(opt, ChainedOptimizer):
+                return opt.chained_optimizers
+            return [opt]
+
+        if self._is_offload_optimizer:
+            load_megatron_optimizer(self.actor_optimizer)
+            print("[INFO] Optimizer reloading for reset")
+
+        for opt in _iter_opts(self.actor_optimizer):
+            torch_opt = getattr(opt, "optimizer", opt)
+            param_groups = getattr(torch_opt, "param_groups", None)
+            if param_groups is None:
+                continue
+            for group in param_groups:
+                capturable = group.get("capturable", False)
+                fused = group.get("fused", False)
+                for p in group["params"]:
+                    state = torch_opt.state.get(p, {})
+                    if not state:
+                        continue
+                    if "exp_avg" in state:
+                        state["exp_avg"].zero_()
+                        print("[INFO] Optimizer states reset: exp_avg")
+                    if "exp_avg_sq" in state:
+                        state["exp_avg_sq"].zero_()
+                        print("[INFO] Optimizer states reset: exp_avg_sq")
+                    if "max_exp_avg_sq" in state:
+                        state["max_exp_avg_sq"].zero_()
+                        print("[INFO] Optimizer states reset: max_exp_avg_sq")
+                    if "step" in state:
+                        step = state["step"]
+                        if isinstance(step, torch.Tensor):
+                            step.zero_()
+                        else:
+                            device = p.device if (capturable or fused) else torch.device("cpu")
+                            state["step"] = torch.zeros((), dtype=torch.float32, device=device)
+                        print("[INFO] Optimizer states reset: step")
+
+        if self._is_offload_optimizer:
+            offload_megatron_optimizer(self.actor_optimizer)
+            print("[INFO] Optimizer offloaded after reset")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, checkpoint_path, hdfs_path=None, del_local_after_load=True):

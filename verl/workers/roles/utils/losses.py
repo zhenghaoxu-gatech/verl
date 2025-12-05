@@ -65,7 +65,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     extra_loss_kwargs = None
-    if loss_mode in ["wpmd", "apmd"]:
+    if loss_mode in ["wpmd", "apmd", "opmd"]:
         partition_weights = data.get("partition_weights", None)
         if partition_weights is None:
             raise ValueError(

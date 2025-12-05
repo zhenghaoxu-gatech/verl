@@ -256,6 +256,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than "
                     f"ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
                 )
+            if self.config.actor.policy_loss.loss_mode in ["cmdpo"]:
+                assert self.config.actor.ppo_micro_batch_size_per_gpu >= self.config.rollout.n, (
+                    f"ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu} should be larger "
+                    f"than rollout.n {self.config.rollout.n}"
+                )
+                assert self.config.actor.ppo_micro_batch_size_per_gpu % self.config.rollout.n == 0, (
+                    f"ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu} should be "
+                    f"divisible by rollout.n {self.config.rollout.n}"
+                )
 
         # normalize rollout config
         if self._is_rollout and self.config.rollout.log_prob_micro_batch_size is not None:

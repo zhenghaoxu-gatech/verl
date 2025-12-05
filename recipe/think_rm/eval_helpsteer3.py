@@ -22,6 +22,7 @@ from recipe.think_rm.eval_utils import (
     apply_correction,
     build_pair_level_results,
     compute_prediction_distribution,
+    derive_run_name,
     ensure_hf_export,
     find_latest_checkpoint,
     load_token_classifier,
@@ -32,6 +33,7 @@ from recipe.think_rm.eval_utils import (
     run_critic_scoring_single,
     save_pair_level_results,
     save_request_generations,
+    resolve_output_artifacts,
     shutdown_process,
     start_vllm_server,
     summarize_pair_statuses,
@@ -220,7 +222,7 @@ def _compute_forward_accuracy(samples: Iterable[PairSample], label_attr: str) ->
 
     for sample in samples:
         ground_truth = (sample.ground_truth or "unknown").lower()
-        if ground_truth not in {"response_1", "response_2"}:
+        if ground_truth not in {"response_1", "response_2", "tie"}:
             continue
         total += 1
         predicted = getattr(sample, label_attr, None)
@@ -231,6 +233,8 @@ def _compute_forward_accuracy(samples: Iterable[PairSample], label_attr: str) ->
             score = 1.0 if ground_truth == "response_1" else 0.0
         elif predicted == "response_2":
             score = 1.0 if ground_truth == "response_2" else 0.0
+        elif predicted == "tie":
+            score = 1.0 if ground_truth == "tie" else 0.5
         else:
             score = 0.5
         evaluated += 1
@@ -597,7 +601,11 @@ def main() -> None:
             tensor_parallel_size=args.tensor_parallel_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
-        sampling_params = SamplingParams(max_tokens=args.max_new_tokens)
+        sampling_params = SamplingParams(
+            max_tokens=args.max_new_tokens,
+            temperature=0.0,
+            logprobs=1,
+        )
         run_actor_generation_vllm_local(actor_llm, sampling_params, actor_tokenizer, samples, args.actor_batch_size)
     else:
         actor_model = AutoModelForCausalLM.from_pretrained(
@@ -650,11 +658,14 @@ def main() -> None:
     raw_samples = list(samples)
     forward_samples = [sample for sample in raw_samples if sample.orientation == "forward"]
 
-    generations_path = output_dir / f"{Path(args.results_file).stem}_generations.jsonl"
+    run_name = derive_run_name(actor_export, checkpoint_dir)
+    artifact_paths = resolve_output_artifacts(output_dir, args.results_file, run_name)
+
+    generations_path = artifact_paths["generations"]
     save_request_generations(raw_samples, generations_path)
 
     pair_results = build_pair_level_results(raw_samples)
-    pair_results_path = output_dir / f"{Path(args.results_file).stem}_pair_results.jsonl"
+    pair_results_path = artifact_paths["pairs"]
     save_pair_level_results(pair_results, pair_results_path)
     pair_status_summary = summarize_pair_statuses(pair_results)
     prompt_status_summary = summarize_prompt_statuses(pair_results)
@@ -740,6 +751,7 @@ def main() -> None:
         "generation_path": str(generations_path),
         "pair_results_path": str(pair_results_path),
         "split_metadata": split_metadata,
+        "run_name": run_name,
     }
 
     if actor_backend == "vllm":
@@ -790,7 +802,7 @@ def main() -> None:
         "config": metrics_config,
     }
 
-    output_path = output_dir / args.results_file
+    output_path = artifact_paths["metrics"]
     _serialize_metrics(metrics, output_path)
 
     if wandb and wandb_mode_env not in {"disabled", "off", "offline"}:

@@ -74,6 +74,8 @@ class AlgoConfig(BaseConfig):
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
         partition_tau (float): Temperature parameter for partition function baseline (specific to PARTITION advantage estimator).
+        partition_reward_lb (Optional[float]): Lower bound of per-prompt average reward for PMD weighting mask.
+        partition_reward_ub (Optional[float]): Upper bound of per-prompt average reward for PMD weighting mask.
     """
 
     gamma: float = 1.0
@@ -87,3 +89,5 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     partition_tau: float = 0.01
+    partition_reward_lb: Optional[float] = None
+    partition_reward_ub: Optional[float] = None

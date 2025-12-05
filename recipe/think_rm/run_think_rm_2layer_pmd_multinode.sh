@@ -3,29 +3,35 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 
 DATA_ROOT=${DATA_ROOT:-${HOME}/data/think_rm}
 TRAIN_PARQUET=${TRAIN_PARQUET:-${DATA_ROOT}/rl/train.parquet}
 VAL_PARQUET=${VAL_PARQUET:-${DATA_ROOT}/rl/validation.parquet}
 PROJECT_NAME=${PROJECT_NAME:-verl_think_rm}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_think_rm_rloo}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_think_rm_pmd}
 
 CRITIC_VALUE_LOSS_TYPE=${CRITIC_VALUE_LOSS_TYPE:-mle}
 CRITIC_VALUE_HEAD_HIDDEN_SIZES=${CRITIC_VALUE_HEAD_HIDDEN_SIZES:-"[2560]"}
 CRITIC_VALUE_HEAD_ACTIVATION=${CRITIC_VALUE_HEAD_ACTIVATION:-silu}
 CRITIC_VALUE_HEAD_DROPOUT=${CRITIC_VALUE_HEAD_DROPOUT:-0.0}
-LOSS_AGG_MODE=${LOSS_AGG_MODE:-"token"}
+LOSS_AGG_MODE=${LOSS_AGG_MODE:-"seq-mean-token-mean"}
 BASE_MODEL_NAME=${BASE_MODEL_NAME:-"Qwen/Qwen3-4B-Thinking-2507"}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 USE_CRITIC=${USE_CRITIC:-True}
 ACTOR_DTYPE=${ACTOR_DTYPE:-"bfloat16"}
 ROLLOUT_DTYPE=${ROLLOUT_DTYPE:-"bfloat16"}
+PMD_TAU=${PMD_TAU:-0.01}
+RESET_OPTIMIZER_FREQ=${RESET_OPTIMIZER_FREQ:-0}
+PPO_EPOCHS=${PPO_EPOCHS:-1}
 
 cd "${REPO_ROOT}"
 
-python -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=rloo \
+ray job submit --address="http://127.0.0.1:8265" \
+    --runtime-env=verl/trainer/runtime_env.yaml \
+    -- python -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=partition \
+    +algorithm.partition_tau=${PMD_TAU} \
     algorithm.gamma=1.0 \
     algorithm.lam=1.0 \
     algorithm.use_kl_in_reward=False \
@@ -48,11 +54,16 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=${ACTOR_LR} \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_epochs=1 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=65536 \
+    +actor_rollout_ref.actor.ppo_infer_max_token_len_per_gpu=65536 \
+    actor_rollout_ref.actor.ppo_epochs=${PPO_EPOCHS} \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE} \
     actor_rollout_ref.actor.dtype=${ACTOR_DTYPE} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${SP_SIZE:-1} \
+    actor_rollout_ref.actor.policy_loss.loss_mode=pmd \
+    +actor_rollout_ref.actor.policy_loss.pmd_tau=${PMD_TAU} \
+    +actor_rollout_ref.actor.reset_optimizer_states_freq=${RESET_OPTIMIZER_FREQ} \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.temperature=0.7 \
@@ -84,6 +95,8 @@ python -m verl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=True \
     critic.ppo_mini_batch_size=64 \
     critic.use_dynamic_bsz=True \
+    critic.ppo_max_token_len_per_gpu=98304 \
+    +critic.ppo_infer_max_token_len_per_gpu=98304 \
     critic.optim.lr=5e-6 \
     trainer.project_name=${PROJECT_NAME} \
     trainer.experiment_name=${EXPERIMENT_NAME} \
