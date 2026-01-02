@@ -1699,12 +1699,12 @@ def compute_policy_loss_opmd(
     max_response_length = response_mask.shape[1]
     if loss_agg_mode == "seq-mean-token-mean":
         weighted_loss = torch.mean(
-            seq_partition_weights * ((seq_advantages / pmd_tau - torch.clamp(seq_log_prob - seq_old_log_prob, min=-20, max=20))**2) / response_lengths
+            pmd_tau * seq_partition_weights * ((seq_advantages / pmd_tau - (seq_log_prob - seq_old_log_prob))**2) / response_lengths
         )
         pg_loss = weighted_loss
     else: # loss_agg_mode == "seq-mean-token-sum-norm"
         weighted_loss = torch.mean(
-            seq_partition_weights * (seq_advantages / pmd_tau - torch.clamp(seq_log_prob - seq_old_log_prob, min=-20, max=20))**2
+            pmd_tau * seq_partition_weights * (seq_advantages / pmd_tau - (seq_log_prob - seq_old_log_prob))**2
         )
         pg_loss = weighted_loss / max_response_length
     
