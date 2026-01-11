@@ -845,7 +845,8 @@ def compute_partition_loo_outcome_advantage(
             if response_num > 1:
                 partition = id2partition[index[i]] - torch.exp((scores[i] - id2max[index[i]]) / tau)
                 # Baseline is the leave-one-out log-mean-exp of other responses in the group.
-                baseline[i] = id2max[index[i]] + tau * torch.log(partition / (response_num - 1))
+                denom = torch.clamp(partition / (response_num - 1), min=1e-8)
+                baseline[i] = id2max[index[i]] + tau * torch.log(denom)
         adv = (scores - baseline).unsqueeze(-1) * response_mask
 
     return adv, adv
