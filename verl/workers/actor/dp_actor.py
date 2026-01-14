@@ -560,9 +560,11 @@ class DataParallelPPOActor(BasePPOActor):
                         log_prob_sum = (log_prob * response_mask).sum(dim=1)  # (bs,)
                         old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)  # (bs,)
                         log_ratios = log_prob_sum - old_log_prob_sum  # (bs,)
+                        ratios = torch.exp(log_ratios)
                         
-                        micro_batch_metrics["training/log_ratio_mean"] = log_ratios.mean().detach().item()
-                        micro_batch_metrics["training/log_ratio_max"] = log_ratios.max().detach().item()
+                        micro_batch_metrics["train/ratio_mean"] = ratios.mean().detach().item()
+                        micro_batch_metrics["train/ratio_min"] = ratios.min().detach().item()
+                        micro_batch_metrics["train/ratio_max"] = ratios.max().detach().item()
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
