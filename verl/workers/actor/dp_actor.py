@@ -555,6 +555,15 @@ class DataParallelPPOActor(BasePPOActor):
                             extra_loss_kwargs=None,
                         )
 
+                    # TODO: (ycl) log the sequence-level \phi_{\theta}/\phi_{old}
+                    if batch_idx == len(mini_batches) -1:
+                        log_prob_sum = (log_prob * response_mask).sum(dim=1)  # (bs,)
+                        old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)  # (bs,)
+                        log_ratios = log_prob_sum - old_log_prob_sum  # (bs,)
+                        
+                        micro_batch_metrics["training/log_ratio_mean"] = log_ratios.mean().detach().item()
+                        micro_batch_metrics["training/log_ratio_max"] = log_ratios.max().detach().item()
+
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
