@@ -464,6 +464,19 @@ class MegatronPPOActor(BasePPOActor):
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                     }
                 )
+
+                is_last_batch = meta_info.get("is_last_batch", False)
+                if is_last_batch:
+
+                    # compute sequence-level ratios
+                    log_prob_sum = (log_prob * response_mask).sum(dim=1)
+                    old_log_prob_sum = (old_log_prob * response_mask).sum(dim=1)
+                    log_ratios = log_prob_sum - old_log_prob_sum
+                    ratios = torch.exp(log_ratios)
+
+                    metrics["train/ratio_mean"] = ratios.mean().detach().item()
+                    metrics["train/ratio_min"] = ratios.min().detach().item()
+                    metrics["train/ratio_max"] = ratios.max().detach().item()
                 policy_loss = pg_loss
 
             if calculate_entropy:
@@ -634,7 +647,14 @@ class MegatronPPOActor(BasePPOActor):
         metrics = {}
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.start()
-        for data in dataloader:
+
+        current_data = next(dataloader, None)
+
+        while current_data is not None:
+            next_data = next(dataloader, None)
+            is_last_batch = (next_data is None)
+
+            data = current_data
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
             for chunk in self.actor_module:
@@ -649,6 +669,8 @@ class MegatronPPOActor(BasePPOActor):
             max_token_len = None
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.config.megatron.context_parallel_size
+
+            data.meta_info["is_last_batch"] = is_last_batch
             metric_micro_batch = self.forward_backward_batch(
                 data,
                 calculate_entropy=calculate_entropy,
@@ -673,6 +695,8 @@ class MegatronPPOActor(BasePPOActor):
                 raise NotImplementedError
             if self.use_torch_profiler and self.prof and self.prof.enable:
                 self.prof.step()
+
+            current_data = next_data
         # add empty cache after each compute
         if self.use_torch_profiler and self.prof and self.prof.enable:
             self.prof.stop_and_save()
